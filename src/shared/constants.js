@@ -17,7 +17,7 @@ export const EXPENSE = [
   ['Streaming Service', 'live_tv'], ['Recreation & Entertainment', 'attractions'],
   ['Travel', 'flight'], ['Gifts & Donations', 'volunteer_activism'], ['Pets', 'pets'],
   ['Money Lent to Friends', 'currency_exchange'], ['Debts to Friends', 'request_quote'],
-  ['Other', 'category']
+  ['Government & Immigration', 'assured_workload'], ['Other', 'category']
 ]
 
 export const CATEGORY_ICON = Object.fromEntries([...INCOME, ...EXPENSE])
