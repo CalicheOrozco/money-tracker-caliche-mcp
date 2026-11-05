@@ -7,6 +7,7 @@ import { monthlyCashflow } from './shared/metrics.js'
 import { currentMonthKey, expensesOf, inMonth, incomeOf, monthLabel, shiftMonth } from './shared/periods.js'
 import { daysUntil, monthlyAmount, recurringState } from './shared/recurring.js'
 import { normalizeTag, parseTags } from './shared/tags.js'
+import { creditCardEstimate, fromApiTransfer, transferSuggestions } from './shared/transfers.js'
 
 const CATEGORIES = [...INCOME, ...EXPENSE].map(([name]) => name)
 const round = n => Math.round(n * 100) / 100
@@ -176,7 +177,7 @@ export function registerTools (server, auth) {
 
   tool('create_transaction', {
     title: 'Add transaction',
-    description: 'Record an expense or income. If no category is given, the user\'s rules and merchants pick one, like in the app.',
+    description: 'Record an expense or income. For money moved between the user\'s own accounts use create_transfer instead. If no category is given, the user\'s rules and merchants pick one, like in the app.',
     inputSchema: {
       name: z.string().min(1),
       amount: money.describe('Positive number; the type decides the sign'),
@@ -284,7 +285,7 @@ export function registerTools (server, auth) {
 
   tool('delete_all_transactions', {
     title: 'Delete all transactions',
-    description: 'Permanently delete every transaction in the account. Only use when the user explicitly asks, and pass the confirmation text exactly.',
+    description: 'Permanently delete every transaction and transfer in the account. Only use when the user explicitly asks, and pass the confirmation text exactly.',
     inputSchema: { confirm: z.literal('DELETE ALL TRANSACTIONS') },
     annotations: DESTROY
   }, async () => api.call('/profile/transactions', { method: 'DELETE' }))
@@ -430,7 +431,7 @@ export function registerTools (server, auth) {
     inputSchema: {
       name: z.string().min(1),
       logo: z.string().optional(),
-      type: z.enum(['credit', 'debit']).optional(),
+      type: z.enum(['credit', 'debit', 'savings', 'investment']).optional(),
       last4: z.string().regex(/^\d{4}$/).optional(),
       credit_limit: z.number().nonnegative().optional(),
       color: z.union([z.enum(Object.keys(TONES)), z.string().regex(/^#[0-9a-fA-F]{6}$/)]).optional()
@@ -637,16 +638,13 @@ export function registerTools (server, auth) {
 
   tool('get_net_worth', {
     title: 'Net worth',
-    description: 'Assets, debts, an estimate of credit card balances from the last 30 days, and the saved history.',
+    description: 'Assets, debts, an estimate of credit card balances from the last 30 days (charges minus payments), and the saved history.',
     annotations: READ
   }, async () => {
-    const [holdings, history, cardList, all] = await Promise.all([
-      list('holdings'), list('networth-snapshots'), cards(), transactions()
+    const [holdings, history, cardList, all, moved] = await Promise.all([
+      list('holdings'), list('networth-snapshots'), cards(), transactions(), transferList()
     ])
-    const credit = new Set(cardList.filter(c => c.type !== 'debit').map(c => c.name))
-    const cardDebt = -all
-      .filter(t => t.amount < 0 && credit.has(t.card) && daysAgo(t.date) >= 0 && daysAgo(t.date) < 30)
-      .reduce((s, t) => s + t.amount, 0)
+    const cardDebt = creditCardEstimate(all, moved, cardList)
     const show = h => ({ id: h._id, name: h.name, kind: h.kind || undefined, value: h.value })
     const assets = holdings.filter(h => h.side === 'asset')
     const debts = holdings.filter(h => h.side === 'liab')
@@ -938,6 +936,108 @@ export function registerTools (server, auth) {
   })
 
   // ---------- Profile ----------
+
+  // ---------- Transfers ----------
+
+  const showTransfer = t => ({
+    id: t.id,
+    date: t.date,
+    from: t.from,
+    to: t.to,
+    amount: t.value,
+    note: t.note || undefined,
+    converted_from_transactions: t.restorable || undefined
+  })
+  const transferList = async () => (await list('transfers')).map(fromApiTransfer)
+
+  async function requireAccounts (...names) {
+    const known = (await cards()).map(c => c.name)
+    const missing = names.filter(name => name !== undefined && !known.includes(name))
+    if (missing.length) throw new Error(`Unknown account: ${missing.join(', ')}. Accounts: ${known.join(', ') || 'none yet'}. Create it with save_card first.`)
+  }
+
+  tool('list_transfers', {
+    title: 'List transfers',
+    description: 'Money the user moved between their own accounts, newest first. Transfers are not income or spending and never appear in list_transactions.',
+    inputSchema: { start_date: date.optional(), end_date: date.optional(), account: z.string().optional().describe('Only transfers from or to this account') },
+    annotations: READ
+  }, async a => (await transferList())
+    .filter(t => (!a.start_date || t.date >= a.start_date) && (!a.end_date || t.date <= a.end_date) && (!a.account || t.from === a.account || t.to === a.account))
+    .sort((x, y) => y.date.localeCompare(x.date))
+    .map(showTransfer))
+
+  tool('create_transfer', {
+    title: 'Create transfer',
+    description: 'Record money moved between two of the user\'s own accounts, like paying a credit card from debit or moving money to investments. Use this instead of create_transaction for those: it does not count as income or spending.',
+    inputSchema: { from: z.string().min(1), to: z.string().min(1), amount: money, date: date.optional().describe('Defaults to today'), note: z.string().optional() },
+    annotations: WRITE
+  }, async a => {
+    await requireAccounts(a.from, a.to)
+    const saved = await create('transfers', { from: a.from, to: a.to, amount: a.amount, date: a.date || toISODate(new Date()), note: a.note })
+    return showTransfer(fromApiTransfer(saved))
+  })
+
+  tool('update_transfer', {
+    title: 'Update transfer',
+    description: 'Change a transfer. Only the fields you send change.',
+    inputSchema: { id: z.string(), from: z.string().min(1).optional(), to: z.string().min(1).optional(), amount: money.optional(), date: date.optional(), note: z.string().optional() },
+    annotations: WRITE
+  }, async a => {
+    await requireAccounts(a.from, a.to)
+    return showTransfer(fromApiTransfer(await update('transfers', a.id, { from: a.from, to: a.to, amount: a.amount, date: a.date, note: a.note })))
+  })
+
+  tool('delete_transfer', {
+    title: 'Delete transfer',
+    description: 'Delete a transfer. With restore_original, a transfer converted from transactions gives those transactions back instead of losing them.',
+    inputSchema: { id: z.string(), restore_original: z.boolean().optional() },
+    annotations: DESTROY
+  }, async a => {
+    if (a.restore_original) {
+      const restored = await api.call(`/me/transfers/${a.id}/revert`, { method: 'POST' })
+      return { id: a.id, restored_transactions: restored.length }
+    }
+    await remove('transfers', a.id)
+    return { id: a.id, deleted: true }
+  })
+
+  tool('list_transfer_suggestions', {
+    title: 'List possible transfers',
+    description: 'Transactions that look like money moving between the user\'s own accounts and may be counted as income or spending by mistake. These are guesses: confirm with the user before converting. A blank from or to means the account has to be chosen.',
+    inputSchema: {},
+    annotations: READ
+  }, async () => {
+    const [all, cardList, dismissed] = await Promise.all([transactions(), cards(), list('transfer-dismissals')])
+    return transferSuggestions(all, dismissed.map(d => d.key), cardList).map(s => ({
+      key: s.key,
+      transaction_ids: s.ids,
+      amount: s.amount,
+      date: s.date,
+      suggested_from: s.from,
+      suggested_to: s.to,
+      transactions: s.items.map(t => present(t))
+    }))
+  })
+
+  tool('convert_to_transfer', {
+    title: 'Convert to transfer',
+    description: 'Replace one transaction, or the expense and income sides of the same move, with a transfer, so they stop counting as income or spending. Undo with delete_transfer and restore_original.',
+    inputSchema: { transaction_ids: z.array(z.string()).min(1).max(2), from: z.string().min(1), to: z.string().min(1), note: z.string().optional() },
+    annotations: WRITE
+  }, async a => {
+    const saved = await api.call('/me/transfers/convert', { method: 'POST', body: { transactionIds: a.transaction_ids, from: a.from, to: a.to, note: a.note } })
+    return showTransfer(fromApiTransfer(saved))
+  })
+
+  tool('dismiss_transfer_suggestion', {
+    title: 'Dismiss transfer suggestion',
+    description: 'Mark a suggestion from list_transfer_suggestions as not being a transfer, so it stops showing.',
+    inputSchema: { key: z.string() },
+    annotations: WRITE
+  }, async a => {
+    await create('transfer-dismissals', { key: a.key })
+    return { key: a.key, dismissed: true }
+  })
 
   tool('get_profile', {
     title: 'Profile and settings',

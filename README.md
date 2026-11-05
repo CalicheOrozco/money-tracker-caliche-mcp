@@ -55,6 +55,7 @@ npm run dev            # http://localhost:8787/mcp
 | Net worth | `get_net_worth`, `add_holding`, `update_holding`, `delete_holding` |
 | Rules | `list_rules`, `create_rule`, `delete_rule`, `apply_rules` |
 | Merchants | `list_merchants`, `list_unmatched_merchants`, `create_merchant`, `update_merchant`, `delete_merchant` |
+| Transfers | `list_transfers`, `create_transfer`, `update_transfer`, `delete_transfer`, `list_transfer_suggestions`, `convert_to_transfer`, `dismiss_transfer_suggestion` |
 | Recurring | `list_recurring`, `update_recurring`, `add_recurring_payment`, `edit_recurring_payment`, `delete_recurring_payment` |
 | Account | `whoami`, `get_profile`, `update_profile`, `change_password`, `delete_account` |
 
