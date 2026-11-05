@@ -11,11 +11,16 @@ const RECEIVED_PAYMENT_NAME = /\b(payment|pago|abono)\b/i
 const TRANSFER_CATEGORIES = ['Debts', 'Savings & Investments']
 
 export const isCreditAccount = card => !card.type || card.type === 'credit'
-export const isStorageAccount = card => card.type === 'savings' || card.type === 'investment'
+const isStorageAccount = card => card.type === 'savings' || card.type === 'investment'
 
 // `amount` stays 0 so a transfer shown among transactions never changes a total.
+// A converted transfer counts from when its original transactions were added, so a
+// balance set in between does not count them twice.
+const oldestId = t => [t._id, ...(t.source || []).map(s => String(s._id))].sort()[0]
+
 export const fromApiTransfer = t => ({
   id: t._id,
+  createdId: oldestId(t),
   transfer: true,
   from: t.from,
   to: t.to,
@@ -44,7 +49,7 @@ const createdSecond = id => parseInt(String(id).slice(0, 8), 16)
 function afterBalance (card, item) {
   if (daysAgo(item.date) < 0) return false
   if (item.date !== card.balanceDate) return item.date > card.balanceDate
-  return createdSecond(item.id) >= Math.floor(new Date(card.balanceSetAt).getTime() / 1000)
+  return createdSecond(item.createdId || item.id) >= Math.floor(new Date(card.balanceSetAt).getTime() / 1000)
 }
 
 // The balance today, or null if it isn't tracked. On a credit card it is the amount owed.
@@ -57,22 +62,19 @@ export function accountBalance (card, transactions, transfers) {
   return isCreditAccount(card) ? card.balance - change : card.balance + change
 }
 
-// What is owed on credit cards: the tracked balance when there is one, otherwise what
-// was charged in the last 30 days minus what was paid in that time.
-export function creditCardEstimate (transactions, transfers, allCards) {
-  const tracked = allCards.filter(c => isCreditAccount(c) && typeof c.balance === 'number')
-  const owedOnTracked = tracked.reduce((total, c) => total + Math.max(0, accountBalance(c, transactions, transfers)), 0)
-  const cards = allCards.filter(c => !tracked.includes(c))
-  const credit = new Set(cards.filter(isCreditAccount).map(c => c.name))
+// What is owed on each credit card: its tracked balance when there is one, otherwise
+// the last 30 days of charges minus payments and refunds on that same card.
+export function creditCardEstimate (transactions, transfers, cards) {
   const recent = t => daysAgo(t.date) >= 0 && daysAgo(t.date) < 30
-  const charged = transactions
-    .filter(t => t.amount < 0 && credit.has(t.card) && recent(t))
-    .reduce((total, t) => total - t.amount, 0)
-  const moved = transfers.filter(recent).reduce((total, t) => {
-    const value = t.value ?? t.amount
-    return total + (credit.has(t.from) ? value : 0) - (credit.has(t.to) ? value : 0)
+  return cards.filter(isCreditAccount).reduce((total, card) => {
+    if (typeof card.balance === 'number') return total + Math.max(0, accountBalance(card, transactions, transfers))
+    const spent = transactions.filter(t => t.card === card.name && recent(t)).reduce((sum, t) => sum - t.amount, 0)
+    const moved = transfers.filter(recent).reduce((sum, t) => {
+      const value = t.value ?? t.amount
+      return sum + (t.from === card.name ? value : 0) - (t.to === card.name ? value : 0)
+    }, 0)
+    return total + Math.max(0, spent + moved)
   }, 0)
-  return owedOnTracked + Math.max(0, charged + moved)
 }
 
 function mentionedAccount (t, cards) {
@@ -95,17 +97,30 @@ function guessDestination (t, cards) {
 export function transferSuggestions (transactions, dismissedKeys, cards) {
   const dismissed = new Set(dismissedKeys)
   const past = transactions.filter(t => daysAgo(t.date) >= 0)
-  const incomes = past.filter(t => t.amount > 0 && t.card)
+  // Incomes grouped by exact amount, so each expense only looks at the same amount.
+  const incomesByAmount = new Map()
+  for (const t of past) {
+    if (!(t.amount > 0 && t.card)) continue
+    const key = cents(t.amount)
+    if (!incomesByAmount.has(key)) incomesByAmount.set(key, [])
+    incomesByAmount.get(key).push({ t, day: parseDay(t.date).getTime() })
+  }
   const used = new Set()
   const found = []
 
   for (const out of past.filter(t => t.amount < 0 && t.card)) {
-    const match = incomes
-      .filter(t =>
-        !used.has(t.id) && t.card !== out.card && cents(t.amount) === cents(out.amount) &&
-        Math.abs(parseDay(t.date) - parseDay(out.date)) <= PAIR_WINDOW_DAYS * DAY
-      )
-      .sort((a, b) => Math.abs(parseDay(a.date) - parseDay(out.date)) - Math.abs(parseDay(b.date) - parseDay(out.date)))[0]
+    const day = parseDay(out.date).getTime()
+    let match = null
+    let closest = Infinity
+    for (const candidate of incomesByAmount.get(cents(out.amount)) || []) {
+      const distance = Math.abs(candidate.day - day)
+      const usable = !used.has(candidate.t.id) && candidate.t.card !== out.card &&
+        distance <= PAIR_WINDOW_DAYS * DAY && !dismissed.has(`pair:${out.id}:${candidate.t.id}`)
+      if (usable && distance < closest) {
+        match = candidate.t
+        closest = distance
+      }
+    }
     if (!match) continue
     used.add(match.id)
     used.add(out.id)
@@ -121,8 +136,11 @@ export function transferSuggestions (transactions, dismissedKeys, cards) {
     })
   }
 
+  // Transactions from a pair the user said is not a transfer aren't offered alone either.
+  const rejected = new Set([...dismissed].filter(key => key.startsWith('pair:')).flatMap(key => key.split(':').slice(1)))
+
   for (const t of past) {
-    if (used.has(t.id)) continue
+    if (used.has(t.id) || rejected.has(t.id)) continue
     const card = cards.find(c => c.name === t.card)
     if (t.amount < 0) {
       const looksLikeTransfer = TRANSFER_CATEGORIES.includes(t.category) || PAYMENT_NAME.test(t.name) || mentionedAccount(t, cards)
@@ -130,7 +148,7 @@ export function transferSuggestions (transactions, dismissedKeys, cards) {
         found.push({ key: `single:${t.id}`, kind: 'single', ids: [t.id], items: [t], amount: -t.amount, date: t.date, from: t.card, to: guessDestination(t, cards) })
       }
     } else if (card && isCreditAccount(card) && RECEIVED_PAYMENT_NAME.test(t.name)) {
-      // A payment received by a credit card, as it appears on an imported statement.
+      // A payment received by a credit card, as banks usually name it.
       found.push({ key: `single:${t.id}`, kind: 'single', ids: [t.id], items: [t], amount: t.amount, date: t.date, from: '', to: t.card })
     }
   }

@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { appClient } from './appApi.js'
+import { AppError, appClient } from './appApi.js'
+import { replaceAppSession } from './oauth.js'
 import { CURRENCIES, EXPENSE, INCOME, RANGES, TONES } from './shared/constants.js'
 import { daysAgo, parseDay, startOfToday, toISODate } from './shared/dates.js'
 import { matchesPatterns, merchantKey, patternMatch, resolveMerchant } from './shared/merchants.js'
@@ -17,6 +18,9 @@ const month = z.string().regex(/^\d{4}-\d{2}$/, 'Use the format YYYY-MM')
 const category = z.enum(CATEGORIES)
 const rangeKey = z.enum(Object.keys(RANGES))
 const money = z.number().positive()
+// Ids go into API paths, so only real ids are accepted.
+const objectId = z.string().regex(/^[a-f0-9]{24}$/i, 'Use an id returned by a list tool')
+const manualKey = z.string().regex(/^manual:[a-f0-9]{24}$/i, 'Use a key starting with manual: from list_recurring')
 
 const READ = { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
 const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
@@ -96,13 +100,21 @@ export function registerTools (server, auth) {
   const api = appClient(auth)
   const id = api.userId
 
-  const transactions = async () =>
-    (await api.call(`/transactions/${id}`)).map(toTx).sort((a, b) => b.date.localeCompare(a.date))
+  // With dates, the app filters on its side, so only that period is downloaded.
+  const transactions = async ({ start, end } = {}) => {
+    const period = start || end ? `?startDate=${start || '1900-01-01'}&endDate=${end || '2999-12-31'}` : ''
+    return (await api.call(`/transactions/${id}${period}`)).map(toTx).sort((a, b) => b.date.localeCompare(a.date))
+  }
+  const monthStart = key => `${key}-01`
+  const monthEnd = key => {
+    const [year, m] = key.split('-').map(Number)
+    return `${key}-${String(new Date(year, m, 0).getDate()).padStart(2, '0')}`
+  }
   const cards = () => api.call(`/cards/${id}`)
   const list = name => api.call(`/me/${name}`)
   const create = (name, body) => api.call(`/me/${name}`, { method: 'POST', body })
-  const update = (name, itemId, body) => api.call(`/me/${name}/${itemId}`, { method: 'PATCH', body })
-  const remove = (name, itemId) => api.call(`/me/${name}/${itemId}`, { method: 'DELETE' })
+  const update = (name, itemId, body) => api.call(`/me/${name}/${encodeURIComponent(itemId)}`, { method: 'PATCH', body })
+  const remove = (name, itemId) => api.call(`/me/${name}/${encodeURIComponent(itemId)}`, { method: 'DELETE' })
 
   // Mirrors the app: a missing category comes from a matching rule, then the merchant's default.
   async function fillCategory (record) {
@@ -116,9 +128,11 @@ export function registerTools (server, auth) {
     return { ...record, tags, category: rule?.category || merchant?.category || 'Other' }
   }
 
-  async function cardIcon (name) {
-    if (!name) return ''
-    return (await cards()).find(c => c.name === name)?.icon || ''
+  // Matches an existing card ignoring case, so "nu" uses the card "Nu" instead of making a new one.
+  async function resolveCard (name) {
+    if (!name || name === 'none') return { card: '', icon: '' }
+    const existing = (await cards()).find(c => c.name.toLowerCase() === name.trim().toLowerCase())
+    return existing ? { card: existing.name, icon: existing.icon || '' } : { card: name.trim(), icon: '' }
   }
 
   function tool (name, config, handler) {
@@ -126,6 +140,11 @@ export function registerTools (server, auth) {
       try {
         return ok(await handler(args || {}))
       } catch (error) {
+        // Expected problems (bad input, the app saying no) are plain errors and only go
+        // back to Claude. Anything else, like a database or code error, is also logged,
+        // without the arguments, which can hold personal data.
+        const expected = error instanceof AppError || error.constructor === Error
+        if (!expected) console.error(`Tool ${name} failed:`, error)
         return fail(error)
       }
     })
@@ -151,7 +170,7 @@ export function registerTools (server, auth) {
     },
     annotations: READ
   }, async a => {
-    const [all, merchants] = await Promise.all([transactions(), list('merchants')])
+    const [all, merchants] = await Promise.all([transactions({ start: a.start_date, end: a.end_date }), list('merchants')])
     const query = a.search?.toLowerCase()
     const tag = a.tag && normalizeTag(a.tag)
     const filtered = all.filter(t =>
@@ -187,7 +206,7 @@ export function registerTools (server, auth) {
       description: z.string().optional(),
       card: z.string().optional().describe('Card name; leave empty for cash'),
       tags: z.array(z.string()).optional(),
-      merchant_id: z.string().optional().describe('Assign a merchant by id, or "none"')
+      merchant_id: z.union([objectId, z.literal('none')]).optional().describe('Assign a merchant by id, or "none"')
     },
     annotations: WRITE
   }, async a => {
@@ -197,8 +216,7 @@ export function registerTools (server, auth) {
       amount: a.type === 'income' ? a.amount : -a.amount,
       date: a.date || toISODate(new Date()),
       category: a.category,
-      card: a.card || '',
-      icon: await cardIcon(a.card),
+      ...(await resolveCard(a.card)),
       tags: parseTags((a.tags || []).join(',')),
       merchant: a.merchant_id || ''
     })
@@ -210,7 +228,7 @@ export function registerTools (server, auth) {
     title: 'Edit transaction',
     description: 'Change any field of an existing transaction. Only the fields you pass are changed.',
     inputSchema: {
-      id: z.string(),
+      id: objectId,
       name: z.string().min(1).optional(),
       amount: money.optional(),
       type: z.enum(['expense', 'income']).optional(),
@@ -219,15 +237,16 @@ export function registerTools (server, auth) {
       description: z.string().optional(),
       card: z.string().optional().describe('Card name, or "" for cash'),
       tags: z.array(z.string()).optional().describe('Replaces all tags'),
-      merchant_id: z.string().optional().describe('Merchant id, "none", or "" for automatic')
+      merchant_id: z.union([objectId, z.literal('none'), z.literal('')]).optional().describe('Merchant id, "none", or "" for automatic')
     },
     annotations: WRITE
   }, async a => {
-    const current = (await transactions()).find(t => t.id === a.id)
+    const current = toTx(await api.call(`/transaction/item/${encodeURIComponent(a.id)}`))
     if (!current) throw new Error('Transaction not found.')
     const type = a.type || (current.amount >= 0 ? 'income' : 'expense')
     const amount = a.amount ?? Math.abs(current.amount)
-    const card = a.card ?? current.card
+    const resolved = a.card === undefined ? { card: current.card, icon: current.icon } : await resolveCard(a.card)
+    const card = resolved.card
     const next = {
       ...current,
       name: a.name ?? current.name,
@@ -236,7 +255,7 @@ export function registerTools (server, auth) {
       date: a.date ?? current.date,
       category: a.category ?? current.category,
       card,
-      icon: card === current.card ? current.icon : await cardIcon(card),
+      icon: card === current.card ? current.icon : resolved.icon,
       tags: a.tags ? parseTags(a.tags.join(',')) : current.tags,
       merchant: a.merchant_id ?? current.merchant
     }
@@ -247,48 +266,19 @@ export function registerTools (server, auth) {
   tool('delete_transaction', {
     title: 'Delete transaction',
     description: 'Permanently delete one transaction by id.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => {
     const deleted = await api.call(`/transaction/delete/${a.id}`, { method: 'DELETE' })
     return { deleted: present(toTx(deleted)) }
   })
 
-  tool('import_transactions', {
-    title: 'Import transactions',
-    description: 'Add many transactions at once, for example from a bank statement the user shared. Amounts are signed: negative for expenses.',
-    inputSchema: {
-      transactions: z.array(z.object({
-        date,
-        name: z.string().min(1),
-        amount: z.number().refine(n => n !== 0, 'Amount cannot be 0'),
-        description: z.string().optional(),
-        category: category.optional(),
-        card: z.string().optional()
-      })).min(1).max(500)
-    },
-    annotations: WRITE
-  }, async a => {
-    const [cardList, rules, merchants] = await Promise.all([cards(), list('rules'), list('merchants')])
-    const rows = a.transactions.map(r => {
-      const text = `${r.name} ${r.description || ''}`.toLowerCase()
-      const rule = rules.find(x => x.match && text.includes(x.match))
-      const categoryName = r.category || rule?.category || patternMatch(merchants, text)?.category || 'Other'
-      return [
-        r.date, r.name, r.description || '', priceOf(r.amount), r.card || '', categoryName,
-        cardList.find(c => c.name === r.card)?.icon || ''
-      ]
-    })
-    const saved = await api.call(`/transactions/multi/${id}`, { method: 'POST', body: rows })
-    return { imported: saved.length }
-  })
-
   tool('delete_all_transactions', {
     title: 'Delete all transactions',
-    description: 'Permanently delete every transaction and transfer in the account. Only use when the user explicitly asks, and pass the confirmation text exactly.',
-    inputSchema: { confirm: z.literal('DELETE ALL TRANSACTIONS') },
+    description: 'Permanently delete every transaction and transfer in the account. Only when the user explicitly asks. Needs the user\'s password, which you must ask the user to type; never reuse or guess one.',
+    inputSchema: { password: z.string().min(1).describe('The user\'s Money Tracker password, typed by the user for this action') },
     annotations: DESTROY
-  }, async () => api.call('/profile/transactions', { method: 'DELETE' }))
+  }, async a => api.call('/profile/transactions', { method: 'DELETE', body: { password: a.password } }))
 
   tool('list_categories', {
     title: 'List categories',
@@ -339,6 +329,7 @@ export function registerTools (server, auth) {
     },
     annotations: READ
   }, async a => {
+    // The all-time balance needs every transaction, not just the period.
     const all = await transactions()
     const period = all.filter(inPeriod(a))
     const income = incomeOf(period)
@@ -368,7 +359,7 @@ export function registerTools (server, auth) {
   }, async a => {
     const key = a.month || currentMonthKey()
     const previous = shiftMonth(key, -1)
-    const all = await transactions()
+    const all = await transactions({ start: monthStart(previous), end: monthEnd(key) })
     const now = inMonth(all, key)
     const before = inMonth(all, previous)
     const [year, m] = key.split('-').map(Number)
@@ -454,6 +445,17 @@ export function registerTools (server, auth) {
     }
   }))
 
+  tool('rename_card', {
+    title: 'Rename card',
+    description: 'Rename a card or account. Its transactions, transfers and recurring payments move to the new name.',
+    inputSchema: { name: z.string().min(1).describe('Current name'), new_name: z.string().min(1).max(60) },
+    annotations: WRITE
+  }, async a => {
+    const current = (await cards()).find(c => c.name.toLowerCase() === a.name.trim().toLowerCase())
+    if (!current) throw new Error(`Unknown card: ${a.name}.`)
+    return api.call(`/cards/${id}/rename`, { method: 'POST', body: { from: current.name, to: a.new_name.trim() } })
+  })
+
   tool('remove_card', {
     title: 'Remove card',
     description: 'Hide a card from the wallet. Its transactions keep the card name.',
@@ -468,7 +470,10 @@ export function registerTools (server, auth) {
     description: 'Monthly budgets per category with this month\'s spending, the projection to month end and last month.',
     annotations: READ
   }, async () => {
-    const [budgets, all] = await Promise.all([list('budgets'), transactions()])
+    const [budgets, all] = await Promise.all([
+      list('budgets'),
+      transactions({ start: monthStart(shiftMonth(currentMonthKey(), -1)), end: monthEnd(currentMonthKey()) })
+    ])
     const now = new Date()
     const days = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
     const thisMonth = inMonth(all, currentMonthKey())
@@ -547,7 +552,7 @@ export function registerTools (server, auth) {
     title: 'Edit goal',
     description: 'Change a goal\'s name, target, due date, saved amount or icon.',
     inputSchema: {
-      id: z.string(),
+      id: objectId,
       name: z.string().min(1).optional(),
       target: money.optional(),
       due_date: date.optional(),
@@ -560,7 +565,7 @@ export function registerTools (server, auth) {
   tool('add_to_goal', {
     title: 'Add money to goal',
     description: 'Add to (or with a negative amount, take from) what is saved toward a goal.',
-    inputSchema: { id: z.string(), amount: z.number().refine(n => n !== 0) },
+    inputSchema: { id: objectId, amount: z.number().refine(n => n !== 0) },
     annotations: WRITE
   }, async a => {
     const goal = (await list('goals')).find(g => g._id === a.id)
@@ -571,7 +576,7 @@ export function registerTools (server, auth) {
   tool('delete_goal', {
     title: 'Delete goal',
     description: 'Delete a savings goal.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => remove('goals', a.id))
 
@@ -611,7 +616,7 @@ export function registerTools (server, auth) {
   tool('update_debt', {
     title: 'Edit debt',
     description: 'Change a debt\'s person, direction, amount or note.',
-    inputSchema: { id: z.string(), person: z.string().min(1).optional(), direction: direction.optional(), amount: money.optional(), note: z.string().optional() },
+    inputSchema: { id: objectId, person: z.string().min(1).optional(), direction: direction.optional(), amount: money.optional(), note: z.string().optional() },
     annotations: WRITE
   }, async a => showDebt(await update('debts', a.id, {
     person: a.person, dir: a.direction && toDir(a.direction), amount: a.amount, note: a.note
@@ -620,7 +625,7 @@ export function registerTools (server, auth) {
   tool('settle_debt', {
     title: 'Settle debt',
     description: 'Mark a debt as paid. By default also records the payment as a transaction, like the app does.',
-    inputSchema: { id: z.string(), record_transaction: z.boolean().optional().describe('Default true') },
+    inputSchema: { id: objectId, record_transaction: z.boolean().optional().describe('Default true') },
     annotations: WRITE
   }, async a => {
     const debt = (await list('debts')).find(d => d._id === a.id)
@@ -642,7 +647,7 @@ export function registerTools (server, auth) {
   tool('delete_debt', {
     title: 'Delete debt',
     description: 'Delete a debt record.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => remove('debts', a.id))
 
@@ -683,14 +688,14 @@ export function registerTools (server, auth) {
   tool('update_holding', {
     title: 'Edit asset or debt',
     description: 'Change the name, kind or current value of an asset or debt.',
-    inputSchema: { id: z.string(), name: z.string().min(1).optional(), kind: z.string().optional(), value: z.number().nonnegative().optional() },
+    inputSchema: { id: objectId, name: z.string().min(1).optional(), kind: z.string().optional(), value: z.number().nonnegative().optional() },
     annotations: WRITE
   }, async a => update('holdings', a.id, { name: a.name, kind: a.kind, value: a.value }))
 
   tool('delete_holding', {
     title: 'Delete asset or debt',
     description: 'Remove an asset or debt from net worth.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => remove('holdings', a.id))
 
@@ -722,14 +727,14 @@ export function registerTools (server, auth) {
   tool('delete_rule', {
     title: 'Delete rule',
     description: 'Delete a rule. Transactions it already changed stay as they are.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => remove('rules', a.id))
 
   tool('apply_rules', {
     title: 'Apply rules to past transactions',
     description: 'Apply one rule, or all rules when no id is given, to existing transactions.',
-    inputSchema: { rule_id: z.string().optional() },
+    inputSchema: { rule_id: objectId.optional() },
     annotations: WRITE
   }, async a => {
     const ids = a.rule_id ? [a.rule_id] : (await list('rules')).map(r => r._id)
@@ -802,7 +807,7 @@ export function registerTools (server, auth) {
   tool('update_merchant', {
     title: 'Edit merchant',
     description: 'Change a merchant. Passing patterns replaces the whole list.',
-    inputSchema: { id: z.string(), ...merchantFields, name: z.string().min(1).optional() },
+    inputSchema: { id: objectId, ...merchantFields, name: z.string().min(1).optional() },
     annotations: WRITE
   }, async a => showMerchant(await update('merchants', a.id, {
     name: a.name, domain: a.website, patterns: a.patterns, category: a.default_category
@@ -811,7 +816,7 @@ export function registerTools (server, auth) {
   tool('delete_merchant', {
     title: 'Delete merchant',
     description: 'Delete a merchant. Its transactions go back to showing the category icon.',
-    inputSchema: { id: z.string() },
+    inputSchema: { id: objectId },
     annotations: DESTROY
   }, async a => remove('merchants', a.id))
 
@@ -927,7 +932,7 @@ export function registerTools (server, auth) {
     title: 'Edit recurring payment',
     description: 'Change a payment that was added by hand. Use its key from list_recurring (it starts with "manual:").',
     inputSchema: {
-      key: z.string().startsWith('manual:'),
+      key: manualKey,
       ...Object.fromEntries(Object.entries(paymentFields).map(([k, v]) => [k, v.optional()])),
       active: z.boolean().optional().describe('false pauses it')
     },
@@ -940,7 +945,7 @@ export function registerTools (server, auth) {
   tool('delete_recurring_payment', {
     title: 'Delete recurring payment',
     description: 'Delete a payment that was added by hand. Detected ones cannot be deleted; mark them "not_recurring" with update_recurring instead.',
-    inputSchema: { key: z.string().startsWith('manual:') },
+    inputSchema: { key: manualKey },
     annotations: DESTROY
   }, async a => {
     await remove('recurring', a.key.slice(7))
@@ -992,7 +997,7 @@ export function registerTools (server, auth) {
   tool('update_transfer', {
     title: 'Update transfer',
     description: 'Change a transfer. Only the fields you send change.',
-    inputSchema: { id: z.string(), from: z.string().min(1).optional(), to: z.string().min(1).optional(), amount: money.optional(), date: date.optional(), note: z.string().optional() },
+    inputSchema: { id: objectId, from: z.string().min(1).optional(), to: z.string().min(1).optional(), amount: money.optional(), date: date.optional(), note: z.string().optional() },
     annotations: WRITE
   }, async a => {
     await requireAccounts(a.from, a.to)
@@ -1002,7 +1007,7 @@ export function registerTools (server, auth) {
   tool('delete_transfer', {
     title: 'Delete transfer',
     description: 'Delete a transfer. With restore_original, a transfer converted from transactions gives those transactions back instead of losing them.',
-    inputSchema: { id: z.string(), restore_original: z.boolean().optional() },
+    inputSchema: { id: objectId, restore_original: z.boolean().optional() },
     annotations: DESTROY
   }, async a => {
     if (a.restore_original) {
@@ -1034,7 +1039,7 @@ export function registerTools (server, auth) {
   tool('convert_to_transfer', {
     title: 'Convert to transfer',
     description: 'Replace one transaction, or the expense and income sides of the same move, with a transfer, so they stop counting as income or spending. Undo with delete_transfer and restore_original.',
-    inputSchema: { transaction_ids: z.array(z.string()).min(1).max(2), from: z.string().min(1), to: z.string().min(1), note: z.string().optional() },
+    inputSchema: { transaction_ids: z.array(objectId).min(1).max(2), from: z.string().min(1), to: z.string().min(1), note: z.string().optional() },
     annotations: WRITE
   }, async a => {
     const saved = await api.call('/me/transfers/convert', { method: 'POST', body: { transactionIds: a.transaction_ids, from: a.from, to: a.to, note: a.note } })
@@ -1095,16 +1100,21 @@ export function registerTools (server, auth) {
     inputSchema: { current_password: z.string().min(1), new_password: z.string().min(8) },
     annotations: WRITE
   }, async a => {
-    await api.call('/profile/password', { method: 'POST', body: { current: a.current_password, next: a.new_password } })
-    return { changed: true }
+    // Changing it ends every session, this connection's too, so it moves to the new one.
+    const { session } = await api.call('/profile/password', { method: 'POST', body: { current: a.current_password, next: a.new_password } })
+    await replaceAppSession(auth.extra.appSession, session.refreshToken)
+    return { changed: true, note: 'Other devices and connected apps were signed out.' }
   })
 
   tool('delete_account', {
     title: 'Delete account',
-    description: 'Permanently delete the user\'s account and all its data. Only when the user explicitly asks, with the confirmation text exactly.',
-    inputSchema: { confirm: z.literal('DELETE MY ACCOUNT') },
+    description: 'Permanently delete the user\'s account and all its data. Only when the user explicitly asks. Needs the user\'s password, which you must ask the user to type; never reuse or guess one.',
+    inputSchema: { password: z.string().min(1).describe('The user\'s Money Tracker password, typed by the user for this action') },
     annotations: DESTROY
-  }, async () => api.call('/profile', { method: 'DELETE' }))
+  }, async a => {
+    await api.call('/profile', { method: 'DELETE', body: { password: a.password } })
+    return { deleted: true }
+  })
 
   tool('whoami', {
     title: 'Connected account',

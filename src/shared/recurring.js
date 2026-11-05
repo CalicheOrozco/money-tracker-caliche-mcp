@@ -6,7 +6,7 @@ const normalize = name => String(name).toLowerCase().replace(/[^a-z0-9]/g, '')
 
 // A charge counts as recurring when the same name shows up at least three times,
 // roughly once a month, for a similar amount.
-export function detectRecurring (transactions, sign) {
+function detectRecurring (transactions, sign) {
   const groups = {}
   for (const t of transactions) {
     const key = normalize(t.name)
@@ -133,6 +133,21 @@ function manualEntry (item, transactions) {
 
 export const daysUntil = date => Math.round((date - startOfToday()) / DAY)
 
+// Every expected charge from today up to `until`.
+function chargeDates (r, until) {
+  if (r.manual) return occurrences(r, until)
+  const today = startOfToday()
+  const dates = []
+  let date = parseDay(r.last.date)
+  for (let i = 0; i < 400; i++) {
+    date = new Date(date)
+    date.setDate(date.getDate() + Math.round(r.avgGap))
+    if (date > until) break
+    if (date >= today) dates.push(date)
+  }
+  return dates
+}
+
 export function dueDatesInMonth (r, year, month) {
   if (r.manual) {
     return occurrences(r, new Date(year, month + 1, 0)).filter(
@@ -154,9 +169,14 @@ export function dueDatesInMonth (r, year, month) {
 export function recurringState (transactions, overrides, manual = []) {
   const byKey = Object.fromEntries(overrides.map(o => [o.key, o]))
   const added = manual.map(item => manualEntry(item, transactions))
-  // A manually added payment replaces the detected one for the same charge.
+  // An active manual payment replaces the detected one for the same charge. Very short
+  // patterns would hide unrelated charges ("net" inside "netflix"), so they don't count.
+  const MIN_MATCH = 4
   const coveredByManual = r =>
-    added.some(m => m.pattern && (r.key.includes(m.pattern) || m.pattern.includes(r.key)))
+    added.some(m => !m.inactive && m.pattern && (
+      (m.pattern.length >= MIN_MATCH && r.key.includes(m.pattern)) ||
+      (r.key.length >= MIN_MATCH && m.pattern.includes(r.key))
+    ))
 
   const detected = detectRecurring(transactions, -1)
     .filter(r => !coveredByManual(r))
@@ -176,11 +196,11 @@ export function recurringState (transactions, overrides, manual = []) {
   const all = [...detected, ...added]
 
   const active = all.filter(r => !r.inactive && !r.review)
+  const until = startOfToday()
+  until.setDate(until.getDate() + 30)
+  // One entry per charge, so a weekly payment shows up four or five times.
   const upcoming = active
-    .filter(r => {
-      const days = daysUntil(r.next)
-      return days >= 0 && days <= 30
-    })
+    .flatMap(r => chargeDates(r, until).map(date => ({ ...r, key: `${r.key}@${date.getTime()}`, next: date })))
     .sort((a, b) => a.next - b.next)
 
   return {

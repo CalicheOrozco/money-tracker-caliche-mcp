@@ -46,9 +46,9 @@ npm run dev            # http://localhost:8787/mcp
 
 | Area | Tools |
 | --- | --- |
-| Transactions | `list_transactions`, `create_transaction`, `update_transaction`, `delete_transaction`, `import_transactions`, `delete_all_transactions`, `list_categories`, `list_tags` |
+| Transactions | `list_transactions`, `create_transaction`, `update_transaction`, `delete_transaction`, `delete_all_transactions`, `list_categories`, `list_tags` |
 | Reports | `get_summary`, `get_monthly_report`, `get_cashflow` |
-| Cards | `list_cards`, `save_card`, `remove_card` |
+| Cards | `list_cards`, `save_card`, `rename_card`, `remove_card` |
 | Budgets | `list_budgets`, `set_budget`, `delete_budget` |
 | Goals | `list_goals`, `create_goal`, `update_goal`, `add_to_goal`, `delete_goal` |
 | Debts | `list_debts`, `create_debt`, `update_debt`, `settle_debt`, `delete_debt` |
@@ -59,6 +59,6 @@ npm run dev            # http://localhost:8787/mcp
 | Recurring | `list_recurring`, `update_recurring`, `add_recurring_payment`, `edit_recurring_payment`, `delete_recurring_payment` |
 | Account | `whoami`, `get_profile`, `update_profile`, `change_password`, `delete_account` |
 
-Destructive tools are marked as such for Claude, and `delete_all_transactions` and `delete_account` also require an exact confirmation text.
+Destructive tools are marked as such for Claude, and `delete_all_transactions` and `delete_account` also need the user's password, which Claude has to ask for. Ids are checked before they reach the app, sign-in attempts are rate limited, and revoking the connector ends its Money Tracker session too.
 
 `src/shared` holds copies of the app's calculation helpers so totals here match the app. Copy them again when the app changes them.

@@ -38,20 +38,35 @@ export const titleCase = text => text.replace(/\b\w/g, c => c.toUpperCase())
 
 const haystack = t => normalize(`${t.name} ${t.desc}`)
 
+// Patterns are normalized once per merchant list and sorted longest first, and each
+// text is matched once, because this runs for every transaction on screen.
+const prepared = new WeakMap()
+
+function prepare (merchants) {
+  let entry = prepared.get(merchants)
+  if (!entry) {
+    const patterns = merchants
+      .flatMap((merchant, order) => merchant.patterns.map(pattern => {
+        const plain = normalize(pattern)
+        return { merchant, plain, tight: compact(plain), order }
+      }))
+      .filter(p => p.plain)
+      .sort((a, b) => b.tight.length - a.tight.length || a.order - b.order)
+    entry = { patterns, results: new Map() }
+    prepared.set(merchants, entry)
+  }
+  return entry
+}
+
 // The longest matching pattern wins, so "uber eats" beats "uber".
 export function patternMatch (merchants, rawText) {
   const text = normalize(rawText)
-  let best = null
-  let bestLength = 0
-  for (const merchant of merchants) {
-    for (const pattern of merchant.patterns) {
-      const length = compact(normalize(pattern)).length
-      if (length > bestLength && contains(text, pattern)) {
-        best = merchant
-        bestLength = length
-      }
-    }
-  }
+  const { patterns, results } = prepare(merchants)
+  if (results.has(text)) return results.get(text)
+  const tightText = compact(text)
+  const best = patterns.find(p => text.includes(p.plain) || tightText.includes(p.tight))?.merchant || null
+  if (results.size > 5000) results.clear()
+  results.set(text, best)
   return best
 }
 

@@ -83,7 +83,7 @@ export function monthlyCashflow (transactions, count = 6) {
       )
     })
     months.push({
-      label: start.toLocaleDateString('en-US', { month: 'short' }),
+      label: start.toLocaleDateString('en-US', count > 12 ? { month: 'short', year: '2-digit' } : { month: 'short' }),
       income: sum(inMonth.filter(t => t.amount > 0)),
       expense: -sum(inMonth.filter(t => t.amount < 0))
     })
