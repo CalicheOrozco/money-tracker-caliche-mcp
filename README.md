@@ -46,7 +46,7 @@ npm run dev            # http://localhost:8787/mcp
 
 | Area | Tools |
 | --- | --- |
-| Transactions | `list_transactions`, `create_transaction`, `update_transaction`, `delete_transaction`, `import_transactions`, `delete_all_transactions`, `list_tags` |
+| Transactions | `list_transactions`, `create_transaction`, `update_transaction`, `delete_transaction`, `import_transactions`, `delete_all_transactions`, `list_categories`, `list_tags` |
 | Reports | `get_summary`, `get_monthly_report`, `get_cashflow` |
 | Cards | `list_cards`, `save_card`, `remove_card` |
 | Budgets | `list_budgets`, `set_budget`, `delete_budget` |

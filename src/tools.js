@@ -289,6 +289,27 @@ export function registerTools (server, auth) {
     annotations: DESTROY
   }, async () => api.call('/profile/transactions', { method: 'DELETE' }))
 
+  tool('list_categories', {
+    title: 'List categories',
+    description: 'Every category the app offers, split into income and expense, with how many transactions use each and their total. Categories are fixed in the app; these are the only valid values.',
+    annotations: READ
+  }, async () => {
+    const usage = {}
+    for (const t of await transactions()) {
+      usage[t.category] ||= { transactions: 0, total: 0 }
+      usage[t.category].transactions++
+      usage[t.category].total = round(usage[t.category].total + Math.abs(t.amount))
+    }
+    const describe = ([name]) => ({ name, ...(usage[name] || { transactions: 0, total: 0 }) })
+    const known = new Set(CATEGORIES)
+    return {
+      income: INCOME.map(describe),
+      expense: EXPENSE.map(describe),
+      // Older transactions can carry names the app no longer offers.
+      other_in_use: Object.keys(usage).filter(name => !known.has(name)).map(name => ({ name, ...usage[name] }))
+    }
+  })
+
   tool('list_tags', {
     title: 'List tags',
     description: 'Every tag used on transactions, with how many transactions and how much was spent.',
