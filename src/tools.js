@@ -809,6 +809,8 @@ export function registerTools (server, auth) {
 
   const showRecurring = r => ({
     key: r.key,
+    added_manually: r.manual || undefined,
+    frequency: r.manual ? r.frequency : 'monthly (detected)',
     name: r.name,
     category: r.category,
     card: r.card || undefined,
@@ -817,7 +819,7 @@ export function registerTools (server, auth) {
     amount_range: r.max - r.min > r.avg * 0.04 ? [round(r.min), round(r.max)] : undefined,
     monthly_cost: round(monthlyAmount(r)),
     yearly_cost: round(monthlyAmount(r) * 12),
-    last_charged: r.last.date,
+    last_charged: r.last?.date,
     next_expected: toISODate(r.next),
     days_until_next: daysUntil(r.next),
     charges_found: r.list.length,
@@ -829,8 +831,8 @@ export function registerTools (server, auth) {
     description: 'Subscriptions and bills detected from repeating monthly charges, ones that need review, inactive ones, and what is due in the next 30 days.',
     annotations: READ
   }, async () => {
-    const [all, overrides] = await Promise.all([transactions(), list('recurring-overrides')])
-    const state = recurringState(all, overrides)
+    const [all, overrides, manual] = await Promise.all([transactions(), list('recurring-overrides'), list('recurring')])
+    const state = recurringState(all, overrides, manual)
     const total = l => round(l.reduce((s, r) => s + monthlyAmount(r), 0))
     return {
       fixed_per_month: round(total(state.lists.subs) + total(state.lists.bills)),
@@ -854,6 +856,20 @@ export function registerTools (server, auth) {
     },
     annotations: WRITE
   }, async a => {
+    // Payments added by hand are changed directly instead of through overrides.
+    if (a.key.startsWith('manual:')) {
+      const manualId = a.key.slice(7)
+      const change = {
+        cancel: { active: false },
+        reactivate: { active: true },
+        confirm: { active: true },
+        mark_subscription: { type: 'sub' },
+        mark_bill: { type: 'bill' }
+      }[a.action]
+      if (!change) throw new Error('Use delete_recurring_payment to remove a payment you added.')
+      await update('recurring', manualId, change)
+      return { key: a.key, done: a.action }
+    }
     const body = {
       confirm: { status: 'confirmed' },
       not_recurring: { status: 'dismissed' },
@@ -864,6 +880,61 @@ export function registerTools (server, auth) {
     }[a.action]
     await create('recurring-overrides', { key: a.key, ...body })
     return { key: a.key, done: a.action }
+  })
+
+  const paymentFields = {
+    name: z.string().min(1),
+    amount: money.describe('Amount of each charge'),
+    type: z.enum(['subscription', 'bill']).optional().describe('Default subscription'),
+    frequency: z.enum(['weekly', 'monthly', 'yearly']).optional().describe('Default monthly'),
+    next_charge: date.describe('Date of the next charge, YYYY-MM-DD'),
+    category: z.enum(EXPENSE.map(([c]) => c)).optional(),
+    card: z.string().optional(),
+    match: z.string().optional().describe('Text in transaction names that identifies its charges. Defaults to the name')
+  }
+  const paymentBody = a => ({
+    name: a.name,
+    amount: a.amount,
+    type: a.type && (a.type === 'bill' ? 'bill' : 'sub'),
+    frequency: a.frequency,
+    next: a.next_charge,
+    category: a.category,
+    card: a.card,
+    match: a.match
+  })
+
+  tool('add_recurring_payment', {
+    title: 'Add recurring payment',
+    description: 'Add a subscription or bill by hand, for charges the automatic detection misses. If it matches a detected one, the detected one is hidden.',
+    inputSchema: paymentFields,
+    annotations: WRITE
+  }, async a => {
+    const saved = await create('recurring', { type: 'sub', frequency: 'monthly', ...paymentBody(a), active: true })
+    return { key: `manual:${saved._id}`, ...paymentBody(a), type: saved.type === 'bill' ? 'bill' : 'subscription', frequency: saved.frequency }
+  })
+
+  tool('edit_recurring_payment', {
+    title: 'Edit recurring payment',
+    description: 'Change a payment that was added by hand. Use its key from list_recurring (it starts with "manual:").',
+    inputSchema: {
+      key: z.string().startsWith('manual:'),
+      ...Object.fromEntries(Object.entries(paymentFields).map(([k, v]) => [k, v.optional()])),
+      active: z.boolean().optional().describe('false pauses it')
+    },
+    annotations: WRITE
+  }, async a => {
+    const saved = await update('recurring', a.key.slice(7), { ...paymentBody(a), active: a.active })
+    return { key: a.key, name: saved.name, amount: saved.amount, frequency: saved.frequency, next_charge: saved.next, active: saved.active }
+  })
+
+  tool('delete_recurring_payment', {
+    title: 'Delete recurring payment',
+    description: 'Delete a payment that was added by hand. Detected ones cannot be deleted; mark them "not_recurring" with update_recurring instead.',
+    inputSchema: { key: z.string().startsWith('manual:') },
+    annotations: DESTROY
+  }, async a => {
+    await remove('recurring', a.key.slice(7))
+    return { deleted: a.key }
   })
 
   // ---------- Profile ----------

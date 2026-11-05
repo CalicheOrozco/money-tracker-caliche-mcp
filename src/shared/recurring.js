@@ -58,11 +58,87 @@ export function detectRecurring (transactions, sign) {
   return found
 }
 
-export const monthlyAmount = r => (r.avg * 30) / r.avgGap
+// Manual payments have an exact frequency; detected ones use their average gap.
+const PER_MONTH = { weekly: 52 / 12, monthly: 1, yearly: 1 / 12 }
+
+export const monthlyAmount = r =>
+  r.manual ? r.avg * (PER_MONTH[r.frequency] ?? 1) : (r.avg * 30) / r.avgGap
+
+const FREQUENCY_DAYS = { weekly: 7, monthly: 30.44, yearly: 365.25 }
+
+// Adds whole periods to an anchor date. Monthly and yearly keep the anchor's day,
+// clamped to shorter months, so a charge on the 31st lands on Feb 28.
+function addPeriods (anchor, frequency, count) {
+  if (frequency === 'weekly') {
+    const date = new Date(anchor)
+    date.setDate(date.getDate() + 7 * count)
+    return date
+  }
+  const months = frequency === 'yearly' ? 12 * count : count
+  const first = new Date(anchor.getFullYear(), anchor.getMonth() + months, 1)
+  const lastDay = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate()
+  return new Date(first.getFullYear(), first.getMonth(), Math.min(anchor.getDate(), lastDay))
+}
+
+// Charges from the stored next date onward, skipping past ones, up to `until`
+// (and at most `limit` of them).
+function occurrences (r, until, limit = Infinity) {
+  const today = startOfToday()
+  const anchor = parseDay(r.anchor)
+  const dates = []
+  for (let n = 0; n < 5000 && dates.length < limit; n++) {
+    const date = addPeriods(anchor, r.frequency, n)
+    if (date > until) break
+    if (date >= today) dates.push(date)
+  }
+  return dates
+}
+
+function manualEntry (item, transactions) {
+  const pattern = normalize(item.match || item.name)
+  const list = pattern
+    ? transactions
+      .filter(t => t.amount < 0 && daysAgo(t.date) >= 0 && normalize(`${t.name} ${t.desc || ''}`).includes(pattern))
+      .sort((a, b) => a.date.localeCompare(b.date))
+    : []
+  const anchor = item.next
+  const [next] = occurrences({ anchor, frequency: item.frequency }, new Date(2200, 0, 1), 1)
+  return {
+    key: `manual:${item._id}`,
+    id: item._id,
+    manual: true,
+    pattern,
+    matchText: item.match || '',
+    name: item.name,
+    category: item.category || 'Other',
+    card: item.card || '',
+    list,
+    avg: item.amount,
+    min: item.amount,
+    max: item.amount,
+    avgGap: FREQUENCY_DAYS[item.frequency] || FREQUENCY_DAYS.monthly,
+    frequency: item.frequency,
+    anchor,
+    type: item.type,
+    last: list[list.length - 1] || null,
+    next: next || parseDay(anchor),
+    stale: false,
+    sure: true,
+    cancelled: !item.active,
+    inactive: !item.active,
+    review: false,
+    dismissed: false
+  }
+}
 
 export const daysUntil = date => Math.round((date - startOfToday()) / DAY)
 
 export function dueDatesInMonth (r, year, month) {
+  if (r.manual) {
+    return occurrences(r, new Date(year, month + 1, 0)).filter(
+      date => date.getFullYear() === year && date.getMonth() === month
+    )
+  }
   const today = startOfToday()
   const dates = []
   let date = parseDay(r.last.date)
@@ -75,10 +151,15 @@ export function dueDatesInMonth (r, year, month) {
   return dates
 }
 
-export function recurringState (transactions, overrides) {
+export function recurringState (transactions, overrides, manual = []) {
   const byKey = Object.fromEntries(overrides.map(o => [o.key, o]))
+  const added = manual.map(item => manualEntry(item, transactions))
+  // A manually added payment replaces the detected one for the same charge.
+  const coveredByManual = r =>
+    added.some(m => m.pattern && (r.key.includes(m.pattern) || m.pattern.includes(r.key)))
 
-  const all = detectRecurring(transactions, -1)
+  const detected = detectRecurring(transactions, -1)
+    .filter(r => !coveredByManual(r))
     .map(r => {
       const override = byKey[r.key] || {}
       const cancelled = override.status === 'cancelled'
@@ -92,6 +173,7 @@ export function recurringState (transactions, overrides) {
       }
     })
     .filter(r => !r.dismissed)
+  const all = [...detected, ...added]
 
   const active = all.filter(r => !r.inactive && !r.review)
   const upcoming = active

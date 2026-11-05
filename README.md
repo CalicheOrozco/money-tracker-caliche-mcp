@@ -55,7 +55,7 @@ npm run dev            # http://localhost:8787/mcp
 | Net worth | `get_net_worth`, `add_holding`, `update_holding`, `delete_holding` |
 | Rules | `list_rules`, `create_rule`, `delete_rule`, `apply_rules` |
 | Merchants | `list_merchants`, `list_unmatched_merchants`, `create_merchant`, `update_merchant`, `delete_merchant` |
-| Recurring | `list_recurring`, `update_recurring` |
+| Recurring | `list_recurring`, `update_recurring`, `add_recurring_payment`, `edit_recurring_payment`, `delete_recurring_payment` |
 | Account | `whoami`, `get_profile`, `update_profile`, `change_password`, `delete_account` |
 
 Destructive tools are marked as such for Claude, and `delete_all_transactions` and `delete_account` also require an exact confirmation text.
