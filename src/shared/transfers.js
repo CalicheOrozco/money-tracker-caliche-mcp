@@ -37,8 +37,32 @@ export const transfersInRange = (transfers, range) =>
 
 export const byNewest = (a, b) => b.date.localeCompare(a.date)
 
-// Charged in the last 30 days, minus what was paid to each credit card in that time.
-export function creditCardEstimate (transactions, transfers, cards) {
+const createdSecond = id => parseInt(String(id).slice(0, 8), 16)
+
+// Whether a movement came after the balance the user entered, which already includes
+// anything earlier. On the balance's own day, only what was added after setting it counts.
+function afterBalance (card, item) {
+  if (daysAgo(item.date) < 0) return false
+  if (item.date !== card.balanceDate) return item.date > card.balanceDate
+  return createdSecond(item.id) >= Math.floor(new Date(card.balanceSetAt).getTime() / 1000)
+}
+
+// The balance today, or null if it isn't tracked. On a credit card it is the amount owed.
+export function accountBalance (card, transactions, transfers) {
+  if (typeof card.balance !== 'number') return null
+  const counted = list => list.filter(item => afterBalance(card, item))
+  const change = counted(transactions.filter(t => t.card === card.name)).reduce((total, t) => total + t.amount, 0) +
+    counted(transfers.filter(t => t.to === card.name)).reduce((total, t) => total + t.value, 0) -
+    counted(transfers.filter(t => t.from === card.name)).reduce((total, t) => total + t.value, 0)
+  return isCreditAccount(card) ? card.balance - change : card.balance + change
+}
+
+// What is owed on credit cards: the tracked balance when there is one, otherwise what
+// was charged in the last 30 days minus what was paid in that time.
+export function creditCardEstimate (transactions, transfers, allCards) {
+  const tracked = allCards.filter(c => isCreditAccount(c) && typeof c.balance === 'number')
+  const owedOnTracked = tracked.reduce((total, c) => total + Math.max(0, accountBalance(c, transactions, transfers)), 0)
+  const cards = allCards.filter(c => !tracked.includes(c))
   const credit = new Set(cards.filter(isCreditAccount).map(c => c.name))
   const recent = t => daysAgo(t.date) >= 0 && daysAgo(t.date) < 30
   const charged = transactions
@@ -48,7 +72,7 @@ export function creditCardEstimate (transactions, transfers, cards) {
     const value = t.value ?? t.amount
     return total + (credit.has(t.from) ? value : 0) - (credit.has(t.to) ? value : 0)
   }, 0)
-  return Math.max(0, charged + moved)
+  return owedOnTracked + Math.max(0, charged + moved)
 }
 
 function mentionedAccount (t, cards) {

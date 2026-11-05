@@ -7,7 +7,7 @@ import { monthlyCashflow } from './shared/metrics.js'
 import { currentMonthKey, expensesOf, inMonth, incomeOf, monthLabel, shiftMonth } from './shared/periods.js'
 import { daysUntil, monthlyAmount, recurringState } from './shared/recurring.js'
 import { normalizeTag, parseTags } from './shared/tags.js'
-import { creditCardEstimate, fromApiTransfer, transferSuggestions } from './shared/transfers.js'
+import { accountBalance, creditCardEstimate, fromApiTransfer, isCreditAccount, transferSuggestions } from './shared/transfers.js'
 
 const CATEGORIES = [...INCOME, ...EXPENSE].map(([name]) => name)
 const round = n => Math.round(n * 100) / 100
@@ -409,13 +409,20 @@ export function registerTools (server, auth) {
 
   tool('list_cards', {
     title: 'List cards',
-    description: 'The user\'s cards with type, last digits, credit limit and what was spent on each this month.',
+    description: 'The user\'s cards and accounts with type, last digits, credit limit, what was spent this month, and the current balance when tracked (balance, or amount_owed on credit cards).',
     annotations: READ
   }, async () => {
-    const [cardList, all] = await Promise.all([cards(), transactions()])
+    const [cardList, all, moved] = await Promise.all([cards(), transactions(), transferList()])
     const month = inMonth(all, currentMonthKey())
+    const shownBalance = c => {
+      const value = accountBalance(c, all, moved)
+      if (value === null) return { balance_tracked: false }
+      const available = isCreditAccount(c) && c.limit ? { credit_available: round(Math.max(0, c.limit - Math.max(0, value))) } : {}
+      return { [isCreditAccount(c) ? 'amount_owed' : 'balance']: round(value), ...available, balance_set_on: c.balanceDate }
+    }
     return cardList.map(c => ({
       name: c.name,
+      ...shownBalance(c),
       type: c.type,
       last4: c.last4 || undefined,
       credit_limit: c.limit || undefined,
@@ -434,12 +441,17 @@ export function registerTools (server, auth) {
       type: z.enum(['credit', 'debit', 'savings', 'investment']).optional(),
       last4: z.string().regex(/^\d{4}$/).optional(),
       credit_limit: z.number().nonnegative().optional(),
+      balance: z.number().optional().describe('What the bank shows, or the amount owed on a credit card. Later movements update it'),
+      balance_date: date.optional().describe('Date of that balance. Defaults to today'),
       color: z.union([z.enum(Object.keys(TONES)), z.string().regex(/^#[0-9a-fA-F]{6}$/)]).optional()
     },
     annotations: WRITE
   }, async a => api.call(`/cards/${id}`, {
     method: 'POST',
-    body: { name: a.name, icon: a.logo, type: a.type, last4: a.last4, limit: a.credit_limit, tone: a.color?.toLowerCase() }
+    body: {
+      name: a.name, icon: a.logo, type: a.type, last4: a.last4, limit: a.credit_limit, tone: a.color?.toLowerCase(),
+      balance: a.balance, balanceDate: a.balance === undefined ? undefined : a.balance_date || toISODate(new Date())
+    }
   }))
 
   tool('remove_card', {
