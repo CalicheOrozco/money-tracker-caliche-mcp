@@ -886,7 +886,7 @@ export function registerTools (server, auth) {
     name: z.string().min(1),
     amount: money.describe('Amount of each charge'),
     type: z.enum(['subscription', 'bill']).optional().describe('Default subscription'),
-    frequency: z.enum(['weekly', 'monthly', 'yearly']).optional().describe('Default monthly'),
+    frequency: z.enum(['weekly', 'biweekly', 'monthly', 'yearly']).optional().describe('Default monthly. biweekly means every 2 weeks'),
     next_charge: date.describe('Date of the next charge, YYYY-MM-DD'),
     category: z.enum(EXPENSE.map(([c]) => c)).optional(),
     card: z.string().optional(),

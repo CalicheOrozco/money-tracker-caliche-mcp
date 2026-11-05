@@ -59,19 +59,19 @@ export function detectRecurring (transactions, sign) {
 }
 
 // Manual payments have an exact frequency; detected ones use their average gap.
-const PER_MONTH = { weekly: 52 / 12, monthly: 1, yearly: 1 / 12 }
+const PER_MONTH = { weekly: 52 / 12, biweekly: 26 / 12, monthly: 1, yearly: 1 / 12 }
 
 export const monthlyAmount = r =>
   r.manual ? r.avg * (PER_MONTH[r.frequency] ?? 1) : (r.avg * 30) / r.avgGap
 
-const FREQUENCY_DAYS = { weekly: 7, monthly: 30.44, yearly: 365.25 }
+const FREQUENCY_DAYS = { weekly: 7, biweekly: 14, monthly: 30.44, yearly: 365.25 }
 
 // Adds whole periods to an anchor date. Monthly and yearly keep the anchor's day,
 // clamped to shorter months, so a charge on the 31st lands on Feb 28.
 function addPeriods (anchor, frequency, count) {
-  if (frequency === 'weekly') {
+  if (frequency === 'weekly' || frequency === 'biweekly') {
     const date = new Date(anchor)
-    date.setDate(date.getDate() + 7 * count)
+    date.setDate(date.getDate() + FREQUENCY_DAYS[frequency] * count)
     return date
   }
   const months = frequency === 'yearly' ? 12 * count : count
