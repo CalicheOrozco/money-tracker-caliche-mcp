@@ -1,3 +1,26 @@
+import { createHash } from 'node:crypto'
+
+const SHOW_PASSWORD = "const i=this.previousElementSibling;const s=i.type==='password';i.type=s?'text':'password';this.setAttribute('aria-label',s?'Hide password':'Show password');this.textContent=s?'Hide':'Show'"
+const SHOW_PASSWORD_HASH = createHash('sha256').update(SHOW_PASSWORD).digest('base64')
+
+// The page can't be framed, only runs its one inline handler, and its form may only
+// go back to this server or to where the sign-in returns.
+export function sendPage (res, status, html, redirectUri) {
+  const returnTo = (() => {
+    try {
+      return redirectUri ? ` ${new URL(redirectUri).origin}` : ''
+    } catch {
+      return ''
+    }
+  })()
+  res.status(status).set({
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'unsafe-hashes' 'sha256-${SHOW_PASSWORD_HASH}'; form-action 'self'${returnTo}; frame-ancestors 'none'; base-uri 'none'`,
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Cache-Control': 'no-store'
+  }).type('html').send(html)
+}
+
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 
 export function renderLogin ({ request, clientName, redirectHost, username = '', error, fatal }) {
@@ -13,7 +36,7 @@ export function renderLogin ({ request, clientName, redirectHost, username = '',
         <label>Password
           <span class="pw">
             <input name="password" type="password" autocomplete="current-password" required>
-            <button type="button" class="eye" aria-label="Show password" onclick="const i=this.previousElementSibling;const s=i.type==='password';i.type=s?'text':'password';this.setAttribute('aria-label',s?'Hide password':'Show password');this.textContent=s?'Hide':'Show'">Show</button>
+            <button type="button" class="eye" aria-label="Show password" onclick="${SHOW_PASSWORD}">Show</button>
           </span>
         </label>
         <button class="primary" name="action" value="allow">Sign in and allow</button>

@@ -3,22 +3,27 @@ import {
   InvalidGrantError,
   InvalidTokenError
 } from '@modelcontextprotocol/sdk/server/auth/errors.js'
-import { AppError, login } from './appApi.js'
+import { AppError, endSession, login } from './appApi.js'
 import { config } from './config.js'
 import { decrypt, encrypt, hashToken, jwtExpiry, randomToken } from './crypto.js'
 import { collections } from './db.js'
-import { renderLogin } from './loginPage.js'
+import { renderLogin, sendPage } from './loginPage.js'
+import { hit, isBlocked } from './rateLimit.js'
 
 const ACCESS_TTL = 60 * 60 * 1000
 const REFRESH_TTL = 30 * 24 * 60 * 60 * 1000
 const CODE_TTL = 5 * 60 * 1000
 const SIGN_IN_TTL = 10 * 60 * 1000
+const CLIENT_TTL = 90 * 24 * 60 * 60 * 1000
+const LOGIN_WINDOW = 15 * 60 * 1000
+const TRUSTED_HOSTS = ['claude.ai', 'claude.com']
 
 const withoutId = doc => {
   if (!doc) return undefined
   const client = { ...doc }
   delete client._id
   delete client.createdAt
+  delete client.expiresAt
   return client
 }
 
@@ -26,7 +31,8 @@ function redirectAllowed (uri) {
   try {
     const url = new URL(uri)
     const loopback = ['localhost', '127.0.0.1'].includes(url.hostname)
-    if (!loopback && url.protocol !== 'https:') return false
+    // Loopback only over http(s), so a custom scheme cannot hand the code to another app.
+    if (loopback ? !['http:', 'https:'].includes(url.protocol) : url.protocol !== 'https:') return false
     return config.allowedRedirectHosts.includes(url.hostname)
   } catch {
     return false
@@ -36,7 +42,11 @@ function redirectAllowed (uri) {
 const clientsStore = {
   async getClient (clientId) {
     const { clients } = await collections()
-    return withoutId(await clients.findOne({ client_id: clientId }))
+    return withoutId(await clients.findOneAndUpdate(
+      { client_id: clientId },
+      { $set: { expiresAt: new Date(Date.now() + CLIENT_TTL) } },
+      { returnDocument: 'after' }
+    ))
   },
 
   // Dynamic Client Registration. Only redirect hosts we trust may register, so a
@@ -47,19 +57,42 @@ const clientsStore = {
       throw new InvalidClientMetadataError(`redirect_uris must use one of: ${config.allowedRedirectHosts.join(', ')}`)
     }
     const { clients } = await collections()
-    await clients.insertOne({ ...client, createdAt: new Date() })
+    await clients.insertOne({ ...client, createdAt: new Date(), expiresAt: new Date(Date.now() + CLIENT_TTL) })
     return client
   }
 }
 
-async function issueTokens ({ clientId, userId, userName, appSession, appSessionExpiresAt, scopes, resource }) {
+// The name a client registers is chosen by whoever registers it, so it is only
+// trusted when the sign-in returns to Claude.
+const displayName = (client, redirectUri) => {
+  const host = new URL(redirectUri).hostname
+  const trusted = TRUSTED_HOSTS.some(name => host === name || host.endsWith(`.${name}`))
+  return trusted ? 'Claude' : `${client.client_name || 'An app'} (not verified)`
+}
+
+// Every token issued from one sign-in shares a family, so revoking or a reused
+// refresh token ends all of them together with the Money Tracker session.
+async function endFamily (doc) {
+  const { tokens } = await collections()
+  if (doc.family) await tokens.deleteMany({ family: doc.family })
+  else await tokens.deleteOne({ hash: doc.hash })
+  if (doc.appSession) {
+    try {
+      await endSession(decrypt(doc.appSession))
+    } catch {
+      // A session that cannot be read has nothing left to end.
+    }
+  }
+}
+
+async function issueTokens ({ clientId, userId, userName, appSession, appSessionExpiresAt, scopes, resource, family = randomToken() }) {
   const { tokens } = await collections()
   const now = Date.now()
   const accessToken = randomToken()
   const refreshToken = randomToken()
   // Our refresh token cannot outlive the Money Tracker session it relies on.
   const refreshExpires = Math.min(now + REFRESH_TTL, appSessionExpiresAt || Infinity)
-  const shared = { clientId, userId, userName, appSession, appSessionExpiresAt, scopes, resource }
+  const shared = { clientId, userId, userName, appSession, appSessionExpiresAt, scopes, resource, family }
 
   await tokens.insertMany([
     { ...shared, kind: 'access', hash: hashToken(accessToken), expiresAt: new Date(now + ACCESS_TTL) },
@@ -81,7 +114,7 @@ export const provider = {
   async authorize (client, params, res) {
     const request = encrypt({
       clientId: client.client_id,
-      clientName: client.client_name || 'Claude',
+      clientName: displayName(client, params.redirectUri),
       redirectUri: params.redirectUri,
       codeChallenge: params.codeChallenge,
       state: params.state,
@@ -89,11 +122,11 @@ export const provider = {
       resource: params.resource?.href,
       expiresAt: Date.now() + SIGN_IN_TTL
     })
-    res.status(200).type('html').send(renderLogin({
+    sendPage(res, 200, renderLogin({
       request,
-      clientName: client.client_name || 'Claude',
+      clientName: displayName(client, params.redirectUri),
       redirectHost: new URL(params.redirectUri).host
-    }))
+    }), params.redirectUri)
   },
 
   async challengeForAuthorizationCode (client, code) {
@@ -112,15 +145,21 @@ export const provider = {
     return issueTokens({ ...doc, clientId: client.client_id })
   },
 
-  // Refresh tokens rotate: the used one is deleted and a new pair is issued.
+  // Refresh tokens rotate. A used one is kept marked until it expires, so if it shows
+  // up again (a sign it was stolen) the whole family is ended.
   async exchangeRefreshToken (client, refreshToken) {
     const { tokens } = await collections()
-    const doc = await tokens.findOneAndDelete({
-      hash: hashToken(refreshToken),
-      kind: 'refresh',
-      clientId: client.client_id
-    })
-    if (!doc || doc.expiresAt < new Date()) throw new InvalidGrantError('Invalid or expired refresh token')
+    const hash = hashToken(refreshToken)
+    const doc = await tokens.findOneAndUpdate(
+      { hash, kind: 'refresh', clientId: client.client_id, used: { $ne: true } },
+      { $set: { used: true } }
+    )
+    if (!doc) {
+      const reused = await tokens.findOne({ hash, kind: 'refresh', clientId: client.client_id })
+      if (reused) await endFamily(reused)
+      throw new InvalidGrantError('Invalid or expired refresh token')
+    }
+    if (doc.expiresAt < new Date()) throw new InvalidGrantError('Invalid or expired refresh token')
     return issueTokens(doc)
   },
 
@@ -140,8 +179,19 @@ export const provider = {
 
   async revokeToken (client, { token }) {
     const { tokens } = await collections()
-    await tokens.deleteOne({ hash: hashToken(token), clientId: client.client_id })
+    const doc = await tokens.findOne({ hash: hashToken(token), clientId: client.client_id })
+    if (doc) await endFamily(doc)
   }
+}
+
+// After a password change the old Money Tracker session no longer works, so every
+// token that used it moves to the new one.
+export async function replaceAppSession (oldEncrypted, refreshToken) {
+  const { tokens } = await collections()
+  await tokens.updateMany(
+    { appSession: oldEncrypted },
+    { $set: { appSession: encrypt(refreshToken), appSessionExpiresAt: jwtExpiry(refreshToken) } }
+  )
 }
 
 // Handles the sign-in form shown by authorize(). The request blob is encrypted,
@@ -151,10 +201,10 @@ export async function handleLogin (req, res) {
   try {
     request = decrypt(req.body.request)
   } catch {
-    return res.status(400).type('html').send(renderLogin({ fatal: 'This sign-in link is not valid. Start again from Claude.' }))
+    return sendPage(res, 400, renderLogin({ fatal: 'This sign-in link is not valid. Start again from Claude.' }))
   }
   if (request.expiresAt < Date.now()) {
-    return res.status(400).type('html').send(renderLogin({ fatal: 'This sign-in link expired. Start again from Claude.' }))
+    return sendPage(res, 400, renderLogin({ fatal: 'This sign-in link expired. Start again from Claude.' }))
   }
 
   const back = new URL(request.redirectUri)
@@ -170,16 +220,23 @@ export async function handleLogin (req, res) {
   const password = String(req.body.password || '')
   const page = { request: req.body.request, clientName: request.clientName, redirectHost: back.host, username }
 
-  if (!username || !password) {
-    return res.status(400).type('html').send(renderLogin({ ...page, error: 'Enter your username and password.' }))
+  const show = (status, error) => sendPage(res, status, renderLogin({ ...page, error }), request.redirectUri)
+
+  if (!username || !password) return show(400, 'Enter your username and password.')
+
+  // Guesses are limited per address and per account, across all server instances.
+  const accountKey = `mcp-login-user:${username.toLowerCase()}`
+  if (await hit(`mcp-login-ip:${req.ip}`, 30, LOGIN_WINDOW) || await isBlocked(accountKey, 10)) {
+    return show(429, 'Too many attempts. Wait a few minutes and try again.')
   }
 
   let session
   try {
     session = await login(username, password)
   } catch (error) {
+    if (error instanceof AppError) await hit(accountKey, 10, LOGIN_WINDOW)
     const message = error instanceof AppError ? error.message : 'Something went wrong. Try again.'
-    return res.status(401).type('html').send(renderLogin({ ...page, error: message }))
+    return show(401, message)
   }
 
   const code = randomToken()
