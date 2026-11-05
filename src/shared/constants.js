@@ -56,7 +56,7 @@ export const CURRENCIES = {
 }
 
 export const DEFAULT_SETTINGS = {
-  currency: 'MXN', defaultRange: '6M', privacyOnOpen: false, budget: 0, largeAmount: 5000,
+  currency: 'MXN', defaultRange: '1M', privacyOnOpen: false, budget: 0, largeAmount: 5000,
   notifications: { daily: false, weekly: false, large: false }
 }
 
