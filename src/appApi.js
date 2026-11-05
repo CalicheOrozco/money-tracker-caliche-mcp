@@ -24,7 +24,12 @@ async function send (path, { method = 'GET', body, token } = {}) {
   return { status: response.status, ok: response.ok, json }
 }
 
-const errorText = (json, status) => json?.error || json?.body?.error || `Money Tracker returned ${status}.`
+// A reply without the API's JSON means APP_URL points somewhere that is not the
+// Money Tracker app, so the message names the host to make that obvious.
+const errorText = (json, status) =>
+  json?.error ||
+  json?.body?.error ||
+  `Money Tracker returned ${status} from ${new URL(config.appUrl).host}. Check that APP_URL is the Money Tracker app's URL.`
 
 // Signs in on the user's behalf. Returns the app's long-lived session.
 export async function login (username, password) {
