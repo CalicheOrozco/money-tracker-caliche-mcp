@@ -756,7 +756,7 @@ export function registerTools (server, auth) {
 
   const showMerchant = (m, stats) => ({
     id: m._id, name: m.name, website: m.domain || undefined, patterns: m.patterns,
-    default_category: m.category || undefined, ...stats
+    default_category: m.category || undefined, always_wins: m.pinned || undefined, ...stats
   })
 
   tool('list_merchants', {
@@ -782,12 +782,13 @@ export function registerTools (server, auth) {
     inputSchema: { limit: z.number().int().min(1).max(200).optional() },
     annotations: READ
   }, async a => {
-    const [merchants, all] = await Promise.all([list('merchants'), transactions()])
+    const [merchants, all, ignores] = await Promise.all([list('merchants'), transactions(), list('merchant-ignores')])
+    const ignored = new Set(ignores.map(i => i.key))
     const groups = {}
     for (const t of all) {
       if (t.merchant === 'none' || resolveMerchant(merchants, t)) continue
       const key = merchantKey(t.name)
-      if (!key) continue
+      if (!key || ignored.has(key)) continue
       groups[key] ||= { suggested_pattern: key, example: t.name, transactions: 0, spent: 0 }
       groups[key].transactions++
       if (t.amount < 0) groups[key].spent = round(groups[key].spent - t.amount)
@@ -799,7 +800,8 @@ export function registerTools (server, auth) {
     name: z.string().min(1),
     website: z.string().optional().describe('Domain for the logo, e.g. walmart.com.mx; "" for no logo'),
     patterns: z.array(z.string().min(1)).optional().describe('Text that identifies the merchant in transaction names'),
-    default_category: category.or(z.literal('')).optional()
+    default_category: category.or(z.literal('')).optional(),
+    always_wins: z.boolean().optional().describe('When this merchant and another both match a transaction, this one wins. Otherwise the longest pattern wins, then the oldest merchant')
   }
 
   tool('create_merchant', {
@@ -808,7 +810,7 @@ export function registerTools (server, auth) {
     inputSchema: merchantFields,
     annotations: WRITE
   }, async a => {
-    const merchant = await create('merchants', { name: a.name, domain: a.website || '', patterns: a.patterns || [], category: a.default_category || '' })
+    const merchant = await create('merchants', { name: a.name, domain: a.website || '', patterns: a.patterns || [], category: a.default_category || '', pinned: a.always_wins || false })
     const matches = (await transactions()).filter(t => matchesPatterns(merchant.patterns, t)).length
     return { ...showMerchant(merchant), matching_transactions: matches }
   })
@@ -819,7 +821,7 @@ export function registerTools (server, auth) {
     inputSchema: { id: objectId, ...merchantFields, name: z.string().min(1).optional() },
     annotations: WRITE
   }, async a => showMerchant(await update('merchants', a.id, {
-    name: a.name, domain: a.website, patterns: a.patterns, category: a.default_category
+    name: a.name, domain: a.website, patterns: a.patterns, category: a.default_category, pinned: a.always_wins
   })))
 
   tool('delete_merchant', {

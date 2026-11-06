@@ -38,37 +38,45 @@ export const titleCase = text => text.replace(/\b\w/g, c => c.toUpperCase())
 
 const haystack = t => normalize(`${t.name} ${t.desc}`)
 
-// Patterns are normalized once per merchant list and sorted longest first, and each
-// text is matched once, because this runs for every transaction on screen.
+// Patterns are normalized once per merchant list, and each text is matched once,
+// because this runs for every transaction on screen.
 const prepared = new WeakMap()
 
 function prepare (merchants) {
   let entry = prepared.get(merchants)
   if (!entry) {
-    const patterns = merchants
-      .flatMap((merchant, order) => merchant.patterns.map(pattern => {
-        const plain = normalize(pattern)
-        return { merchant, plain, tight: compact(plain), order }
-      }))
-      .filter(p => p.plain)
-      .sort((a, b) => b.tight.length - a.tight.length || a.order - b.order)
+    const patterns = merchants.flatMap((merchant, order) => merchant.patterns.map(pattern => {
+      const plain = normalize(pattern)
+      return { merchant, pattern, plain, tight: compact(plain), order }
+    })).filter(p => p.plain)
     entry = { patterns, results: new Map() }
     prepared.set(merchants, entry)
   }
   return entry
 }
 
-// The longest matching pattern wins, so "uber eats" beats "uber".
-export function patternMatch (merchants, rawText) {
+// Every merchant whose patterns appear in the text, best first: a merchant set to always
+// win, then the most specific (longest) pattern, then the merchant added first.
+export function matchAll (merchants, rawText) {
   const text = normalize(rawText)
   const { patterns, results } = prepare(merchants)
   if (results.has(text)) return results.get(text)
   const tightText = compact(text)
-  const best = patterns.find(p => text.includes(p.plain) || tightText.includes(p.tight))?.merchant || null
+  const best = new Map()
+  for (const p of patterns) {
+    if (!(text.includes(p.plain) || tightText.includes(p.tight))) continue
+    const current = best.get(p.merchant)
+    if (!current || p.tight.length > current.tight.length) best.set(p.merchant, p)
+  }
+  const hits = [...best.values()]
+    .sort((a, b) => (b.merchant.pinned ? 1 : 0) - (a.merchant.pinned ? 1 : 0) || b.tight.length - a.tight.length || a.order - b.order)
+    .map(p => ({ merchant: p.merchant, pattern: p.pattern }))
   if (results.size > 5000) results.clear()
-  results.set(text, best)
-  return best
+  results.set(text, hits)
+  return hits
 }
+
+export const patternMatch = (merchants, rawText) => matchAll(merchants, rawText)[0]?.merchant || null
 
 export function resolveMerchant (merchants, t) {
   if (t.merchant === 'none') return null
@@ -77,6 +85,28 @@ export function resolveMerchant (merchants, t) {
     if (chosen) return chosen
   }
   return patternMatch(merchants, haystack(t))
+}
+
+// The merchant of a transaction and how it was decided: chosen by hand, or the
+// pattern that matched.
+export function merchantMatch (merchants, t) {
+  if (t.merchant === 'none') return null
+  if (t.merchant) {
+    const chosen = merchants.find(m => m._id === t.merchant)
+    if (chosen) return { merchant: chosen, pattern: '', manual: true }
+  }
+  return matchAll(merchants, haystack(t))[0] || null
+}
+
+// A short pattern from a statement name: its first words, at least four letters long.
+export function suggestPattern (key) {
+  const words = String(key).split(' ').filter(Boolean)
+  const out = []
+  for (const word of words) {
+    out.push(word)
+    if (out.join(' ').length >= 4) break
+  }
+  return out.join(' ') || key
 }
 
 export const matchesPatterns = (patterns, t) => {
