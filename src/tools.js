@@ -154,7 +154,7 @@ export function registerTools (server, auth) {
 
   tool('list_transactions', {
     title: 'List transactions',
-    description: 'Search the user\'s transactions, newest first. Amounts are signed: negative for expenses, positive for income. Combine filters freely.',
+    description: 'Search the user\'s transactions, newest first unless sort says otherwise. Amounts are signed: negative for expenses, positive for income. Combine filters freely.',
     inputSchema: {
       start_date: date.optional().describe('First day to include, YYYY-MM-DD'),
       end_date: date.optional().describe('Last day to include, YYYY-MM-DD'),
@@ -165,6 +165,7 @@ export function registerTools (server, auth) {
       tag: z.string().optional(),
       min_amount: z.number().nonnegative().optional().describe('Minimum absolute amount'),
       max_amount: z.number().nonnegative().optional().describe('Maximum absolute amount'),
+      sort: z.enum(['newest', 'oldest', 'largest', 'smallest']).optional().describe('Default newest. largest and smallest compare the amount without its sign'),
       limit: z.number().int().min(1).max(1000).optional().describe('Default 100'),
       offset: z.number().int().min(0).optional()
     },
@@ -184,6 +185,14 @@ export function registerTools (server, auth) {
       (a.max_amount === undefined || Math.abs(t.amount) <= a.max_amount) &&
       (!query || `${t.name} ${t.desc} ${t.category} ${t.tags.map(x => '#' + x).join(' ')}`.toLowerCase().includes(query))
     )
+    const size = t => Math.abs(t.amount)
+    const order = {
+      newest: (x, y) => y.date.localeCompare(x.date),
+      oldest: (x, y) => x.date.localeCompare(y.date),
+      largest: (x, y) => size(y) - size(x) || y.date.localeCompare(x.date),
+      smallest: (x, y) => size(x) - size(y) || y.date.localeCompare(x.date)
+    }[a.sort || 'newest']
+    filtered.sort(order)
     const offset = a.offset || 0
     const page = filtered.slice(offset, offset + (a.limit || 100))
     return {
