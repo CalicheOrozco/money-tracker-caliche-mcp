@@ -1234,6 +1234,20 @@ export function registerTools (server, auth) {
     return { reset: true, username: result.username, note: 'That account was signed out everywhere. Share the new password with its owner privately.' }
   })
 
+  tool('list_app_errors', {
+    title: 'App errors',
+    description: 'Admin only: errors the Money Tracker server, app and daily jobs reported in the last 30 days, newest first, with how often each happened. The app refuses it for anyone who is not the admin.',
+    annotations: READ
+  }, async () => (await api.call('/admin/errors')).map(e => ({
+    message: e.message,
+    source: e.source,
+    where: e.path || undefined,
+    times: e.count,
+    first_seen: e.firstAt,
+    last_seen: e.lastAt,
+    stack: e.stack ? e.stack.split('\n').slice(0, 6).join('\n') : undefined
+  })))
+
   tool('delete_account', {
     title: 'Delete account',
     description: 'Permanently delete the user\'s account and all its data. Only when the user explicitly asks. Needs the user\'s password, which you must ask the user to type; never reuse or guess one.',
