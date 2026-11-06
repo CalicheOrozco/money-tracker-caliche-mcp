@@ -11,6 +11,10 @@ const RECEIVED_PAYMENT_NAME = /\b(payment|pago|abono)\b/i
 const TRANSFER_CATEGORIES = ['Debts', 'Savings & Investments']
 
 export const isCreditAccount = card => !card.type || card.type === 'credit'
+export const isCashAccount = card => card.type === 'cash'
+
+// Transactions without a card are cash, so they belong to the cash account.
+export const belongsTo = card => t => t.card === card.name || (isCashAccount(card) && !t.card)
 const isStorageAccount = card => card.type === 'savings' || card.type === 'investment'
 
 // `amount` stays 0 so a transfer shown among transactions never changes a total.
@@ -56,7 +60,7 @@ function afterBalance (card, item) {
 export function accountBalance (card, transactions, transfers) {
   if (typeof card.balance !== 'number') return null
   const counted = list => list.filter(item => afterBalance(card, item))
-  const change = counted(transactions.filter(t => t.card === card.name)).reduce((total, t) => total + t.amount, 0) +
+  const change = counted(transactions.filter(belongsTo(card))).reduce((total, t) => total + t.amount, 0) +
     counted(transfers.filter(t => t.to === card.name)).reduce((total, t) => total + t.value, 0) -
     counted(transfers.filter(t => t.from === card.name)).reduce((total, t) => total + t.value, 0)
   return isCreditAccount(card) ? card.balance - change : card.balance + change

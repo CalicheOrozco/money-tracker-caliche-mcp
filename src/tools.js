@@ -429,7 +429,7 @@ export function registerTools (server, auth) {
     inputSchema: {
       name: z.string().min(1),
       logo: z.string().optional(),
-      type: z.enum(['credit', 'debit', 'savings', 'investment']).optional(),
+      type: z.enum(['credit', 'debit', 'savings', 'investment', 'cash']).optional().describe('cash is money on hand: transactions without a card count toward it'),
       last4: z.string().regex(/^\d{4}$/).optional(),
       credit_limit: z.number().nonnegative().optional(),
       balance: z.number().optional().describe('What the bank shows, or the amount owed on a credit card. Later movements update it'),
