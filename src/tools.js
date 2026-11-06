@@ -1118,6 +1118,24 @@ export function registerTools (server, auth) {
     return { changed: true, note: 'Other devices and connected apps were signed out.' }
   })
 
+  tool('reset_user_password', {
+    title: 'Reset a user\'s password',
+    description: 'Admin only: set a new password for any Money Tracker account, for someone who forgot theirs. The app refuses it for anyone who is not the admin. Every session of that account ends. Only when the user explicitly asks; use the exact username and the password the user gives, never invent one.',
+    inputSchema: {
+      username: z.string().min(1).max(40).describe('Username of the account to reset'),
+      new_password: z.string().min(8).max(72).describe('The new password, typed by the user')
+    },
+    annotations: DESTROY
+  }, async a => {
+    const result = await api.call('/admin/reset-password', { method: 'POST', body: { username: a.username, password: a.new_password } })
+    // Resetting your own password also ended this connection's session.
+    if (result.session) {
+      await replaceAppSession(auth.extra.appSession, result.session.refreshToken)
+      return { reset: true, username: result.username, note: 'Your other devices and connected apps were signed out. This connection keeps working.' }
+    }
+    return { reset: true, username: result.username, note: 'That account was signed out everywhere. Share the new password with its owner privately.' }
+  })
+
   tool('delete_account', {
     title: 'Delete account',
     description: 'Permanently delete the user\'s account and all its data. Only when the user explicitly asks. Needs the user\'s password, which you must ask the user to type; never reuse or guess one.',
