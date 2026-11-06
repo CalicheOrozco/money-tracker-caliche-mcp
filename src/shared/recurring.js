@@ -212,9 +212,12 @@ export function recurringState (transactions, overrides, manual = []) {
   const until = startOfToday()
   until.setDate(until.getDate() + 30)
   // One entry per charge, so a weekly payment shows up four or five times.
-  const upcoming = active
+  const each = list => list
     .flatMap(r => chargeDates(r, until).map(date => ({ ...r, key: `${r.key}@${date.getTime()}`, next: date })))
     .sort((a, b) => a.next - b.next)
+  const upcoming = each(active)
+  // Expected deposits, for knowing when the next pay arrives.
+  const upcomingIncome = each(activeIncome)
 
   return {
     all,
@@ -227,6 +230,7 @@ export function recurringState (transactions, overrides, manual = []) {
     },
     review: all.filter(r => r.review && !r.inactive),
     upcoming,
+    upcomingIncome,
     income: activeIncome.reduce((total, r) => total + monthlyAmount(r), 0)
   }
 }

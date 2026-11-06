@@ -39,7 +39,7 @@ export const RANGE_LABEL = {
 }
 
 export const SECTIONS = [
-  ['balance', 'Balance & trend', 'show_chart'], ['stats', 'Period summary', 'donut_large'],
+  ['balance', 'Balance & trend', 'show_chart'], ['ahead', 'Safe to spend', 'account_balance_wallet'], ['stats', 'Period summary', 'donut_large'],
   ['cards', 'Cards', 'credit_card'], ['categories', 'Where it went', 'pie_chart'],
   ['tx', 'Transactions', 'receipt_long']
 ]

@@ -5,6 +5,7 @@ import { cardDue } from './shared/cardCycle.js'
 import { CURRENCIES, EXPENSE, INCOME, RANGES, TONES } from './shared/constants.js'
 import { daysAgo, parseDay, startOfToday, toISODate } from './shared/dates.js'
 import { matchesPatterns, merchantKey, patternMatch, resolveMerchant } from './shared/merchants.js'
+import { safeToSpend } from './shared/forecast.js'
 import { monthlyCashflow } from './shared/metrics.js'
 import { currentMonthKey, expenseCategories, expensesOf, inMonth, incomeOf, monthLabel, shiftMonth } from './shared/periods.js'
 import { daysUntil, monthlyAmount, recurringState } from './shared/recurring.js'
@@ -445,6 +446,28 @@ export function registerTools (server, auth) {
   }, async a => monthlyCashflow(await transactions(), a.months || 6).map(m => ({
     month: m.label, income: round(m.income), expenses: round(m.expense), net: round(m.income - m.expense)
   })))
+
+  tool('get_safe_to_spend', {
+    title: 'Safe to spend',
+    description: 'How much the user can spend until their next pay: money in debit and cash accounts with a tracked balance, minus bills and credit card payments due before the next expected income. Also says if the money would go below zero in the next 30 days, and when.',
+    annotations: READ
+  }, async () => {
+    const [cardList, all, moved, overrides, manual] = await Promise.all([cards(), transactions(), transferList(), list('recurring-overrides'), list('recurring')])
+    const result = safeToSpend({ cards: cardList, transactions: all, transfers: moved, recurring: recurringState(all, overrides, manual), today: toISODate(new Date()) })
+    if (!result.ready) {
+      return { ready: false, note: 'No debit or cash account has a tracked balance. Ask the user for the current balance and set it with save_card.' }
+    }
+    return {
+      safe_to_spend: result.safe,
+      per_day: result.perDay,
+      until: result.until,
+      next_pay: result.payday ? { name: result.payday.name, date: result.payday.date, amount: result.payday.amount } : null,
+      in_accounts: result.accounts,
+      due_before_then: result.upcoming.map(item => ({ type: item.kind === 'card' ? 'card_payment' : 'bill', name: item.name, date: item.date, amount: -item.amount })),
+      lowest_point_next_30_days: result.lowest,
+      goes_below_zero: result.firstNegative
+    }
+  })
 
   // ---------- Cards ----------
 
