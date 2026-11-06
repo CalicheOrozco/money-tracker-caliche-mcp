@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { AppError, appClient } from './appApi.js'
 import { replaceAppSession } from './oauth.js'
+import { cardDue } from './shared/cardCycle.js'
 import { CURRENCIES, EXPENSE, INCOME, RANGES, TONES } from './shared/constants.js'
 import { daysAgo, parseDay, startOfToday, toISODate } from './shared/dates.js'
 import { matchesPatterns, merchantKey, patternMatch, resolveMerchant } from './shared/merchants.js'
@@ -23,6 +24,7 @@ const money = z.number().positive()
 const objectId = z.string().regex(/^[a-f0-9]{24}$/i, 'Use an id returned by a list tool')
 const splitsSchema = z.array(z.object({ category, amount: money })).max(10)
   .describe('Parts of one purchase in different categories, each with a positive amount. They must add up to the amount. Pass [] to remove a split')
+const dayOfMonth = z.number().int().min(1).max(31)
 const manualKey = z.string().regex(/^manual:[a-f0-9]{24}$/i, 'Use a key starting with manual: from list_recurring')
 
 const READ = { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -92,6 +94,20 @@ function groupTotals (list, keyOf) {
     if (key) totals[key] = (totals[key] || 0) - t.amount
   }
   return Object.entries(totals).sort((a, b) => b[1] - a[1])
+}
+
+// The next payment of a credit card with a due day, as list_cards shows it.
+function nextPayment (card, transactions, transfers) {
+  const due = cardDue(card, transactions, transfers, toISODate(new Date()))
+  if (!due) return undefined
+  return {
+    due_date: due.dueDate,
+    statement_closed: due.closeDate || undefined,
+    statement_issued: due.issued,
+    amount: due.amountDue,
+    days_left: due.daysLeft,
+    paid: due.paid
+  }
 }
 
 // Validates a split the same way the app does. An empty list means no split.
@@ -434,7 +450,7 @@ export function registerTools (server, auth) {
 
   tool('list_cards', {
     title: 'List cards',
-    description: 'The user\'s cards and accounts with type, last digits, credit limit, what was spent this month, and the current balance when tracked (balance, or amount_owed on credit cards).',
+    description: 'The user\'s cards and accounts with type, last digits, credit limit, what was spent this month, the current balance when tracked (balance, or amount_owed on credit cards), and for credit cards with a due day, the next payment.',
     annotations: READ
   }, async () => {
     const [cardList, all, moved] = await Promise.all([cards(), transactions(), transferList()])
@@ -453,6 +469,9 @@ export function registerTools (server, auth) {
       credit_limit: c.limit || undefined,
       logo: c.icon || undefined,
       color: c.tone || undefined,
+      statement_day: c.statementDay || undefined,
+      due_day: c.dueDay || undefined,
+      next_payment: nextPayment(c, all, moved),
       spent_this_month: round(expensesOf(month.filter(t => t.card === c.name)))
     }))
   })
@@ -468,6 +487,8 @@ export function registerTools (server, auth) {
       credit_limit: z.number().nonnegative().optional(),
       balance: z.number().optional().describe('What the bank shows, or the amount owed on a credit card. Later movements update it'),
       balance_date: date.optional().describe('Date of that balance. Defaults to today'),
+      statement_day: z.union([dayOfMonth, z.null()]).optional().describe('Credit cards: day of the month the statement closes. null clears it'),
+      due_day: z.union([dayOfMonth, z.null()]).optional().describe('Credit cards: day of the month the payment is due. null clears it'),
       color: z.union([z.enum(Object.keys(TONES)), z.string().regex(/^#[0-9a-fA-F]{6}$/)]).optional()
     },
     annotations: WRITE
@@ -475,7 +496,9 @@ export function registerTools (server, auth) {
     method: 'POST',
     body: {
       name: a.name, icon: a.logo, type: a.type, last4: a.last4, limit: a.credit_limit, tone: a.color?.toLowerCase(),
-      balance: a.balance, balanceDate: a.balance === undefined ? undefined : a.balance_date || toISODate(new Date())
+      balance: a.balance, balanceDate: a.balance === undefined ? undefined : a.balance_date || toISODate(new Date()),
+      statementDay: a.statement_day === null ? '' : a.statement_day,
+      dueDay: a.due_day === null ? '' : a.due_day
     }
   }))
 
@@ -1119,13 +1142,22 @@ export function registerTools (server, auth) {
       hide_amounts_on_open: z.boolean().optional(),
       monthly_budget: z.number().nonnegative().optional(),
       large_expense_alert_amount: z.number().nonnegative().optional(),
-      notifications: z.object({ daily: z.boolean().optional(), weekly: z.boolean().optional(), large: z.boolean().optional() }).optional()
+      notifications: z.object({
+        daily: z.boolean().optional(),
+        weekly: z.boolean().optional(),
+        large: z.boolean().optional(),
+        card_due: z.boolean().optional().describe('Reminders 3 days before and on the day a credit card payment is due')
+      }).optional()
     },
     annotations: WRITE
   }, async a => {
     const settings = {
       currency: a.currency, defaultRange: a.default_range, privacyOnOpen: a.hide_amounts_on_open,
-      budget: a.monthly_budget, largeAmount: a.large_expense_alert_amount, notifications: a.notifications
+      budget: a.monthly_budget,
+      largeAmount: a.large_expense_alert_amount,
+      notifications: a.notifications && {
+        daily: a.notifications.daily, weekly: a.notifications.weekly, large: a.notifications.large, cardDue: a.notifications.card_due
+      }
     }
     const p = await api.call('/profile', { method: 'PATCH', body: { name: a.name, username: a.username, email: a.email, settings } })
     return { name: p.name, username: p.username, email: p.email, settings: p.settings }

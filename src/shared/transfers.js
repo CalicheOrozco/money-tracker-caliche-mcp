@@ -50,16 +50,17 @@ const createdSecond = id => parseInt(String(id).slice(0, 8), 16)
 
 // Whether a movement came after the balance the user entered, which already includes
 // anything earlier. On the balance's own day, only what was added after setting it counts.
-function afterBalance (card, item) {
-  if (daysAgo(item.date) < 0) return false
+// `today` is a YYYY-MM-DD day; without it, the device's today is used.
+function afterBalance (card, item, today) {
+  if (today ? item.date > today : daysAgo(item.date) < 0) return false
   if (item.date !== card.balanceDate) return item.date > card.balanceDate
   return createdSecond(item.createdId || item.id) >= Math.floor(new Date(card.balanceSetAt).getTime() / 1000)
 }
 
 // The balance today, or null if it isn't tracked. On a credit card it is the amount owed.
-export function accountBalance (card, transactions, transfers) {
+export function accountBalance (card, transactions, transfers, today) {
   if (typeof card.balance !== 'number') return null
-  const counted = list => list.filter(item => afterBalance(card, item))
+  const counted = list => list.filter(item => afterBalance(card, item, today))
   const change = counted(transactions.filter(belongsTo(card))).reduce((total, t) => total + t.amount, 0) +
     counted(transfers.filter(t => t.to === card.name)).reduce((total, t) => total + t.value, 0) -
     counted(transfers.filter(t => t.from === card.name)).reduce((total, t) => total + t.value, 0)
