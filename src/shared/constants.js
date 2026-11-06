@@ -10,7 +10,7 @@ export const INCOME = [
 
 export const EXPENSE = [
   ['Housing', 'home'], ['Utilities', 'lightbulb'], ['Food', 'restaurant'],
-  ['Transportation', 'directions_car'], ['Medical & Healthcare', 'medical_services'],
+  ['Transportation', 'directions_car'], ['Car & Fuel', 'local_gas_station'], ['Medical & Healthcare', 'medical_services'],
   ['Insurance', 'shield'], ['Savings & Investments', 'savings'],
   ['Personal Spending', 'shopping_bag'], ['Debts', 'credit_card'],
   ['Education & Training', 'school'], ['Personal Care', 'face'], ['Clothing', 'checkroom'],
