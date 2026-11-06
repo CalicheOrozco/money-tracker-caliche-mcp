@@ -12,6 +12,7 @@ import { daysUntil, monthlyAmount, recurringState } from './shared/recurring.js'
 import { byCategoryEntries, inCategory, isSplit, splitProblem } from './shared/splits.js'
 import { normalizeTag, parseTags } from './shared/tags.js'
 import { accountBalance, creditCardEstimate, fromApiTransfer, isCreditAccount, transferSuggestions } from './shared/transfers.js'
+import { yearReview, yearsWithData } from './shared/yearReview.js'
 
 const CATEGORIES = [...INCOME, ...EXPENSE].map(([name]) => name)
 const round = n => Math.round(n * 100) / 100
@@ -466,6 +467,23 @@ export function registerTools (server, auth) {
       due_before_then: result.upcoming.map(item => ({ type: item.kind === 'card' ? 'card_payment' : 'bill', name: item.name, date: item.date, amount: -item.amount })),
       lowest_point_next_30_days: result.lowest,
       goes_below_zero: result.firstNegative
+    }
+  })
+
+  tool('get_year_in_review', {
+    title: 'Year in review',
+    description: 'A whole year: income, spending and savings against the year before, each month, categories with their change, what grew and shrank the most, biggest expenses, spending by tag, and the totals a tax return usually asks for (income by type, medical, education and donations). Rules differ by country, so present tax figures as totals, not advice.',
+    inputSchema: { year: z.number().int().min(2000).max(2100).optional().describe('Defaults to the current year') },
+    annotations: READ
+  }, async a => {
+    const all = await transactions()
+    const today = toISODate(new Date())
+    const year = a.year || Number(today.slice(0, 4))
+    const review = yearReview(all, year, today)
+    return {
+      ...review,
+      years_with_data: yearsWithData(all, today),
+      biggest: review.biggest.map(t => present(t))
     }
   })
 
