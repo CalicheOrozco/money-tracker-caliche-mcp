@@ -94,11 +94,13 @@ function occurrences (r, until, limit = Infinity) {
   return dates
 }
 
+// Manual income matches deposits; everything else matches charges.
 function manualEntry (item, transactions) {
   const pattern = normalize(item.match || item.name)
+  const sameDirection = t => (item.type === 'income' ? t.amount > 0 : t.amount < 0)
   const list = pattern
     ? transactions
-      .filter(t => t.amount < 0 && daysAgo(t.date) >= 0 && normalize(`${t.name} ${t.desc || ''}`).includes(pattern))
+      .filter(t => sameDirection(t) && daysAgo(t.date) >= 0 && normalize(`${t.name} ${t.desc || ''}`).includes(pattern))
       .sort((a, b) => a.date.localeCompare(b.date))
     : []
   const anchor = item.next
@@ -168,32 +170,43 @@ export function dueDatesInMonth (r, year, month) {
 
 export function recurringState (transactions, overrides, manual = []) {
   const byKey = Object.fromEntries(overrides.map(o => [o.key, o]))
-  const added = manual.map(item => manualEntry(item, transactions))
-  // An active manual payment replaces the detected one for the same charge. Very short
-  // patterns would hide unrelated charges ("net" inside "netflix"), so they don't count.
+  const entries = manual.map(item => manualEntry(item, transactions))
+  const added = entries.filter(m => m.type !== 'income')
+  const addedIncome = entries.filter(m => m.type === 'income')
+  // An active manual entry replaces the detected one for the same charge or deposit. Very
+  // short patterns would hide unrelated ones ("net" inside "netflix"), so they don't count.
   const MIN_MATCH = 4
-  const coveredByManual = r =>
-    added.some(m => !m.inactive && m.pattern && (
+  const coveredBy = list => r =>
+    list.some(m => !m.inactive && m.pattern && (
       (m.pattern.length >= MIN_MATCH && r.key.includes(m.pattern)) ||
       (r.key.length >= MIN_MATCH && m.pattern.includes(r.key))
     ))
+  const withOverride = r => {
+    const override = byKey[r.key] || {}
+    const cancelled = override.status === 'cancelled'
+    return {
+      ...r,
+      type: override.type || r.type,
+      cancelled,
+      inactive: cancelled || r.stale,
+      review: !r.sure && !override.status,
+      dismissed: override.status === 'dismissed'
+    }
+  }
 
   const detected = detectRecurring(transactions, -1)
-    .filter(r => !coveredByManual(r))
-    .map(r => {
-      const override = byKey[r.key] || {}
-      const cancelled = override.status === 'cancelled'
-      return {
-        ...r,
-        type: override.type || r.type,
-        cancelled,
-        inactive: cancelled || r.stale,
-        review: !r.sure && !override.status,
-        dismissed: override.status === 'dismissed'
-      }
-    })
+    .filter(r => !coveredBy(added)(r))
+    .map(withOverride)
     .filter(r => !r.dismissed)
   const all = [...detected, ...added]
+
+  // Recurring income: deposits that repeat about monthly, plus the ones added by hand.
+  const detectedIncome = detectRecurring(transactions, 1)
+    .filter(r => !coveredBy(addedIncome)(r))
+    .map(r => ({ ...withOverride(r), type: 'income', review: false }))
+    .filter(r => !r.dismissed)
+  const incomes = [...detectedIncome, ...addedIncome]
+  const activeIncome = incomes.filter(r => !r.inactive)
 
   const active = all.filter(r => !r.inactive && !r.review)
   const until = startOfToday()
@@ -209,12 +222,11 @@ export function recurringState (transactions, overrides, manual = []) {
     lists: {
       subs: active.filter(r => r.type === 'sub'),
       bills: active.filter(r => r.type === 'bill'),
-      inactive: all.filter(r => r.inactive)
+      income: activeIncome,
+      inactive: [...all, ...incomes].filter(r => r.inactive)
     },
     review: all.filter(r => r.review && !r.inactive),
     upcoming,
-    income: detectRecurring(transactions, 1)
-      .filter(r => !r.stale)
-      .reduce((total, r) => total + monthlyAmount(r), 0)
+    income: activeIncome.reduce((total, r) => total + monthlyAmount(r), 0)
   }
 }

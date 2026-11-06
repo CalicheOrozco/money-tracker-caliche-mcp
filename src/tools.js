@@ -829,7 +829,7 @@ export function registerTools (server, auth) {
     name: r.name,
     category: r.category,
     card: r.card || undefined,
-    type: r.type === 'sub' ? 'subscription' : 'bill',
+    type: r.type === 'sub' ? 'subscription' : r.type === 'income' ? 'income' : 'bill',
     average_amount: round(r.avg),
     amount_range: r.max - r.min > r.avg * 0.04 ? [round(r.min), round(r.max)] : undefined,
     monthly_cost: round(monthlyAmount(r)),
@@ -843,7 +843,7 @@ export function registerTools (server, auth) {
 
   tool('list_recurring', {
     title: 'Recurring payments',
-    description: 'Subscriptions and bills detected from repeating monthly charges, ones that need review, inactive ones, and what is due in the next 30 days.',
+    description: 'Subscriptions, bills and recurring income, detected from repeating monthly transactions or added by hand, ones that need review, inactive ones, and what is due in the next 30 days.',
     annotations: READ
   }, async () => {
     const [all, overrides, manual] = await Promise.all([transactions(), list('recurring-overrides'), list('recurring')])
@@ -854,6 +854,7 @@ export function registerTools (server, auth) {
       subscriptions_per_month: total(state.lists.subs),
       bills_per_month: total(state.lists.bills),
       recurring_income_per_month: round(state.income),
+      income: state.lists.income.map(showRecurring),
       subscriptions: state.lists.subs.map(showRecurring),
       bills: state.lists.bills.map(showRecurring),
       needs_review: state.review.map(showRecurring),
@@ -899,18 +900,18 @@ export function registerTools (server, auth) {
 
   const paymentFields = {
     name: z.string().min(1),
-    amount: money.describe('Amount of each charge'),
-    type: z.enum(['subscription', 'bill']).optional().describe('Default subscription'),
+    amount: money.describe('Amount of each charge, or of each payment for income'),
+    type: z.enum(['subscription', 'bill', 'income']).optional().describe('Default subscription. income is money received regularly, like a salary'),
     frequency: z.enum(['weekly', 'biweekly', 'monthly', 'yearly']).optional().describe('Default monthly. biweekly means every 2 weeks'),
-    next_charge: date.describe('Date of the next charge, YYYY-MM-DD'),
-    category: z.enum(EXPENSE.map(([c]) => c)).optional(),
+    next_charge: date.describe('Date of the next charge or payment, YYYY-MM-DD'),
+    category: category.optional().describe('An expense category, or an income category for income'),
     card: z.string().optional(),
     match: z.string().optional().describe('Text in transaction names that identifies its charges. Defaults to the name')
   }
   const paymentBody = a => ({
     name: a.name,
     amount: a.amount,
-    type: a.type && (a.type === 'bill' ? 'bill' : 'sub'),
+    type: a.type && ({ bill: 'bill', income: 'income' }[a.type] || 'sub'),
     frequency: a.frequency,
     next: a.next_charge,
     category: a.category,
@@ -920,12 +921,12 @@ export function registerTools (server, auth) {
 
   tool('add_recurring_payment', {
     title: 'Add recurring payment',
-    description: 'Add a subscription or bill by hand, for charges the automatic detection misses. If it matches a detected one, the detected one is hidden.',
+    description: 'Add a subscription, bill or recurring income (like a salary) by hand, for ones the automatic detection misses. If it matches a detected one, the detected one is hidden.',
     inputSchema: paymentFields,
     annotations: WRITE
   }, async a => {
     const saved = await create('recurring', { type: 'sub', frequency: 'monthly', ...paymentBody(a), active: true })
-    return { key: `manual:${saved._id}`, ...paymentBody(a), type: saved.type === 'bill' ? 'bill' : 'subscription', frequency: saved.frequency }
+    return { key: `manual:${saved._id}`, ...paymentBody(a), type: { bill: 'bill', income: 'income' }[saved.type] || 'subscription', frequency: saved.frequency }
   })
 
   tool('edit_recurring_payment', {
