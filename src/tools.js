@@ -5,8 +5,9 @@ import { CURRENCIES, EXPENSE, INCOME, RANGES, TONES } from './shared/constants.j
 import { daysAgo, parseDay, startOfToday, toISODate } from './shared/dates.js'
 import { matchesPatterns, merchantKey, patternMatch, resolveMerchant } from './shared/merchants.js'
 import { monthlyCashflow } from './shared/metrics.js'
-import { currentMonthKey, expensesOf, inMonth, incomeOf, monthLabel, shiftMonth } from './shared/periods.js'
+import { currentMonthKey, expenseCategories, expensesOf, inMonth, incomeOf, monthLabel, shiftMonth } from './shared/periods.js'
 import { daysUntil, monthlyAmount, recurringState } from './shared/recurring.js'
+import { byCategoryEntries, inCategory, isSplit, splitProblem } from './shared/splits.js'
 import { normalizeTag, parseTags } from './shared/tags.js'
 import { accountBalance, creditCardEstimate, fromApiTransfer, isCreditAccount, transferSuggestions } from './shared/transfers.js'
 
@@ -20,6 +21,8 @@ const rangeKey = z.enum(Object.keys(RANGES))
 const money = z.number().positive()
 // Ids go into API paths, so only real ids are accepted.
 const objectId = z.string().regex(/^[a-f0-9]{24}$/i, 'Use an id returned by a list tool')
+const splitsSchema = z.array(z.object({ category, amount: money })).max(10)
+  .describe('Parts of one purchase in different categories, each with a positive amount. They must add up to the amount. Pass [] to remove a split')
 const manualKey = z.string().regex(/^manual:[a-f0-9]{24}$/i, 'Use a key starting with manual: from list_recurring')
 
 const READ = { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -38,7 +41,8 @@ function toTx (t) {
     card: t.card || '',
     icon: t.icon || '',
     tags: Array.isArray(t.tags) ? t.tags : [],
-    merchant: t.merchant || ''
+    merchant: t.merchant || '',
+    splits: Array.isArray(t.splits) ? t.splits : []
   }
 }
 
@@ -52,7 +56,8 @@ const present = (t, merchant) => ({
   category: t.category,
   card: t.card || undefined,
   tags: t.tags.length ? t.tags : undefined,
-  merchant: merchant ? merchant.name : undefined
+  merchant: merchant ? merchant.name : undefined,
+  split: isSplit(t) ? t.splits : undefined
 })
 
 const priceOf = amount => (amount < 0 ? '-' : '+') + Math.abs(amount).toFixed(2)
@@ -67,7 +72,8 @@ function toApi (t) {
     card: t.card || '',
     icon: t.icon || '',
     tags: t.tags || [],
-    merchant: t.merchant || ''
+    merchant: t.merchant || '',
+    splits: t.splits || []
   }
 }
 
@@ -87,6 +93,17 @@ function groupTotals (list, keyOf) {
   }
   return Object.entries(totals).sort((a, b) => b[1] - a[1])
 }
+
+// Validates a split the same way the app does. An empty list means no split.
+function checkedSplits (splits, amount) {
+  if (!splits || splits.length === 0) return []
+  const parts = splits.map(part => ({ category: part.category, amount: round(part.amount) }))
+  const problem = splitProblem(parts, amount)
+  if (problem) throw new Error(problem)
+  return parts
+}
+
+const largestPart = splits => [...splits].sort((a, b) => b.amount - a.amount)[0].category
 
 function ok (data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
@@ -178,7 +195,7 @@ export function registerTools (server, auth) {
       (!a.start_date || t.date >= a.start_date) &&
       (!a.end_date || t.date <= a.end_date) &&
       (!a.type || (a.type === 'income' ? t.amount > 0 : t.amount < 0)) &&
-      (!a.category || t.category.toLowerCase() === a.category.toLowerCase()) &&
+      (!a.category || inCategory(t, CATEGORIES.find(c => c.toLowerCase() === a.category.toLowerCase()) || a.category)) &&
       (!a.card || (a.card === 'none' ? !t.card : t.card.toLowerCase() === a.card.toLowerCase())) &&
       (!tag || t.tags.includes(tag)) &&
       (a.min_amount === undefined || Math.abs(t.amount) >= a.min_amount) &&
@@ -215,10 +232,12 @@ export function registerTools (server, auth) {
       description: z.string().optional(),
       card: z.string().optional().describe('Card name; leave empty for cash'),
       tags: z.array(z.string()).optional(),
-      merchant_id: z.union([objectId, z.literal('none')]).optional().describe('Assign a merchant by id, or "none"')
+      merchant_id: z.union([objectId, z.literal('none')]).optional().describe('Assign a merchant by id, or "none"'),
+      split: splitsSchema.optional()
     },
     annotations: WRITE
   }, async a => {
+    const splits = checkedSplits(a.split, a.amount)
     const record = await fillCategory({
       name: a.name.trim(),
       desc: a.description || '',
@@ -227,7 +246,9 @@ export function registerTools (server, auth) {
       category: a.category,
       ...(await resolveCard(a.card)),
       tags: parseTags((a.tags || []).join(',')),
-      merchant: a.merchant_id || ''
+      merchant: a.merchant_id || '',
+      splits,
+      ...(splits.length && { category: largestPart(splits) })
     })
     const saved = await api.call(`/transaction/${id}`, { method: 'POST', body: toApi(record) })
     return { created: present(toTx(saved)) }
@@ -246,7 +267,8 @@ export function registerTools (server, auth) {
       description: z.string().optional(),
       card: z.string().optional().describe('Card name, or "" for cash'),
       tags: z.array(z.string()).optional().describe('Replaces all tags'),
-      merchant_id: z.union([objectId, z.literal('none'), z.literal('')]).optional().describe('Merchant id, "none", or "" for automatic')
+      merchant_id: z.union([objectId, z.literal('none'), z.literal('')]).optional().describe('Merchant id, "none", or "" for automatic'),
+      split: splitsSchema.optional().describe('Replaces the split. Changing the amount without a new split removes it')
     },
     annotations: WRITE
   }, async a => {
@@ -268,6 +290,9 @@ export function registerTools (server, auth) {
       tags: a.tags ? parseTags(a.tags.join(',')) : current.tags,
       merchant: a.merchant_id ?? current.merchant
     }
+    // A new amount without new parts would no longer add up, so the split goes away.
+    next.splits = a.split !== undefined ? checkedSplits(a.split, amount) : amount === Math.abs(current.amount) ? current.splits : []
+    if (next.splits.length && !a.category) next.category = largestPart(next.splits)
     const saved = await api.call(`/transaction/update/${a.id}`, { method: 'PUT', body: toApi(next) })
     return { updated: present(toTx(saved)) }
   })
@@ -295,7 +320,7 @@ export function registerTools (server, auth) {
     annotations: READ
   }, async () => {
     const usage = {}
-    for (const t of await transactions()) {
+    for (const t of byCategoryEntries(await transactions())) {
       usage[t.category] ||= { transactions: 0, total: 0 }
       usage[t.category].transactions++
       usage[t.category].total = round(usage[t.category].total + Math.abs(t.amount))
@@ -352,7 +377,7 @@ export function registerTools (server, auth) {
       net: round(income - expenses),
       savings_rate_percent: income ? Math.round(((income - expenses) / income) * 100) : null,
       balance_all_time: round(all.filter(t => daysAgo(t.date) >= 0).reduce((s, t) => s + t.amount, 0)),
-      by_category: groupTotals(expenseList, t => t.category).map(([name, amount]) => ({
+      by_category: groupTotals(byCategoryEntries(expenseList), t => t.category).map(([name, amount]) => ({
         category: name, amount: round(amount), share_percent: expenses ? Math.round((amount / expenses) * 100) : 0
       })),
       by_card: groupTotals(expenseList, t => t.card || 'Cash / no card').map(([name, amount]) => ({ card: name, amount: round(amount) })),
@@ -390,7 +415,7 @@ export function registerTools (server, auth) {
         day: i + 1, spent: round(expensesOf(now.filter(t => Number(t.date.slice(8)) === i + 1)))
       })).filter(d => d.spent > 0),
       biggest_expenses: now.filter(t => t.amount < 0).sort((x, y) => x.amount - y.amount).slice(0, 5).map(t => present(t)),
-      by_category: [...new Set(now.filter(t => t.amount < 0).map(t => t.category))]
+      by_category: expenseCategories(now)
         .map(c => ({ category: c, amount: round(expensesOf(now, c)), previous: round(expensesOf(before, c)) }))
         .sort((x, y) => y.amount - x.amount)
     }

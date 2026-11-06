@@ -1,5 +1,6 @@
 import { PALETTE, RANGES } from './constants.js'
 import { daysAgo, parseDay } from './dates.js'
+import { byCategoryEntries } from './splits.js'
 
 const sum = list => list.reduce((total, t) => total + t.amount, 0)
 
@@ -31,7 +32,7 @@ export function computeMetrics (transactions, range) {
   }
 
   const totals = {}
-  for (const t of inRange) {
+  for (const t of byCategoryEntries(inRange)) {
     if (t.amount < 0) totals[t.category] = (totals[t.category] || 0) - t.amount
   }
   const categories = Object.entries(totals)

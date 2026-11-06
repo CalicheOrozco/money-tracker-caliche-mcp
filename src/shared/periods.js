@@ -1,4 +1,5 @@
 import { daysAgo } from './dates.js'
+import { byCategoryEntries } from './splits.js'
 
 export const monthKey = (year, month) => {
   const date = new Date(year, month, 1)
@@ -23,10 +24,15 @@ export const monthLabel = (key, style = 'long') => {
 export const inMonth = (transactions, key) =>
   transactions.filter(t => t.date.startsWith(key) && daysAgo(t.date) >= 0)
 
+// With a category, the parts of split transactions count in their own categories.
 export const expensesOf = (list, category) =>
-  -list
+  -(category ? byCategoryEntries(list) : list)
     .filter(t => t.amount < 0 && (!category || t.category === category))
     .reduce((total, t) => total + t.amount, 0)
+
+// Every category with spending in the list, split parts included.
+export const expenseCategories = list =>
+  [...new Set(byCategoryEntries(list).filter(t => t.amount < 0).map(t => t.category))]
 
 export const incomeOf = list =>
   list.filter(t => t.amount > 0).reduce((total, t) => total + t.amount, 0)
